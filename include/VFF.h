@@ -237,40 +237,47 @@ bool precision_land(float err_max)
   • 无隐式依赖：所有中间变量均在函数内声明
 
 【参数说明】
-  @param target_x_rel  目标点X坐标（相对起飞点，单位：米）
-  @param target_y_rel  目标点Y坐标（相对起飞点，单位：米）
-  @param target_yaw    目标航向角（弧度），用于setpoint_raw.yaw输出
+  @param target_x_rel        目标点X（相对起飞点，米）
+  @param target_y_rel        目标点Y（相对起飞点，米）
+  @param target_yaw          目标航向角（弧度）
+  @param uav_radius          无人机等效半径（米，来自yaml）
+  @param safe_margin         安全裕度（米，来自yaml）
+  @param repulsive_gain      排斥力增益（来自yaml）
+  @param max_speed           最大速度（米/秒，来自yaml）
+  @param min_safe_distance   力场最小距离（米，来自yaml）
+  @param max_repulsive_force 排斥力上限（来自yaml）
   @return bool         true=已抵达目标点附近（<0.4m），false=避障中
 ========================================================================*/
 bool vff_avoidance(
     float target_x_rel,
     float target_y_rel,
-    float target_yaw)
+    float target_yaw,
+    float uav_radius,          // 显式传入（解决编译错误）
+    float safe_margin,         // 显式传入
+    float repulsive_gain,      // 显式传入
+    float max_speed,           // 显式传入
+    float min_safe_distance,   // 显式传入
+    float max_repulsive_force) // 显式传入
 {
-    // ========== 1. 栅格系统定义（函数静态变量 = 符合"无文件级全局变量"规范） ==========
-    // 设计依据：VFF必须维持跨帧栅格状态，但避免污染文件作用域
-    // 静态变量特性：首次调用初始化，后续调用保持状态（C++11线程安全）
-    static constexpr int GRID_SIZE = 50;                       // 50×50栅格（5m×5m覆盖范围）
-    static constexpr float GRID_RESOLUTION = 0.1f;             // 0.1米/栅格
-    static constexpr float DECAY_FACTOR = 0.92f;               // 指数衰减系数（每帧）
-    static constexpr float UPDATE_STRENGTH = 35.0f;            // 障碍物更新强度
-    static float certainty_grid[GRID_SIZE][GRID_SIZE] = {{0}}; // 置信度0~100
+    // ========== 1. 栅格系统（函数静态变量，符合规范） ==========
+    static constexpr int GRID_SIZE = 50;
+    static constexpr float GRID_RESOLUTION = 0.1f;
+    static constexpr float DECAY_FACTOR = 0.92f;
+    static constexpr float UPDATE_STRENGTH = 35.0f;
+    static float certainty_grid[GRID_SIZE][GRID_SIZE] = {{0}};
 
-    // ========== 2. 时空基准量（直接使用全局变量，非const） ==========
+    // ========== 2. 时空基准（无const，符合要求） ==========
     float drone_x = local_pos.pose.pose.position.x;
     float drone_y = local_pos.pose.pose.position.y;
-    float drone_yaw = yaw; // 世界坐标系偏航角（用于扇形筛选）
+    float drone_yaw = yaw;
 
-    // 目标点世界坐标（起飞点偏移 + 相对坐标）
     float target_x_world = init_position_x_take_off + target_x_rel;
     float target_y_world = init_position_y_take_off + target_y_rel;
 
-    // 无人机→目标向量
     float dx_to_target = target_x_world - drone_x;
     float dy_to_target = target_y_world - drone_y;
     float dist_to_target = std::sqrt(dx_to_target * dx_to_target + dy_to_target * dy_to_target);
 
-    // 边界处理：目标过近（<0.3m）直接悬停
     if (dist_to_target < 0.3f)
     {
         setpoint_raw.position.x = drone_x;
@@ -281,9 +288,9 @@ bool vff_avoidance(
         return true;
     }
 
-    // ========== 3. 栅格更新流水线（VFF核心三步） ==========
+    // ========== 3. 栅格更新（使用传入参数） ==========
     {
-        // 3.1 栅格衰减（模拟障碍物消失，抗传感器噪声）
+        // 3.1 栅格衰减
         for (int i = 0; i < GRID_SIZE; ++i)
         {
             for (int j = 0; j < GRID_SIZE; ++j)
@@ -294,29 +301,22 @@ bool vff_avoidance(
             }
         }
 
-        // 3.2 障碍物投影到栅格（世界坐标 → 栅格坐标）
-        float HALF_GRID = GRID_SIZE / 2.0f; // 栅格中心索引(25,25)
+        // 3.2 障碍物投影（关键：使用传入的uav_radius和safe_margin）
+        float HALF_GRID = GRID_SIZE / 2.0f;
 
         for (const auto &obs : obstacles)
         {
-            // 计算障碍物在栅格坐标系中的位置
-            // 公式：栅格坐标 = (世界坐标 - 无人机位置) / 分辨率 + 栅格中心
             float grid_x = (obs.position.x() - drone_x) / GRID_RESOLUTION + HALF_GRID;
             float grid_y = (obs.position.y() - drone_y) / GRID_RESOLUTION + HALF_GRID;
 
-            // 边界检查：忽略栅格外的障碍物
             if (grid_x < 0 || grid_x >= GRID_SIZE || grid_y < 0 || grid_y >= GRID_SIZE)
-            {
                 continue;
-            }
 
-            // 计算障碍物影响半径（栅格单位）
-            // 安全半径 = 障碍物半径 + 无人机半径 + 安全裕度（全部来自yaml全局变量）
-            float safe_radius_world = obs.radius + UAV_radius + safe_margin;
+            // ✅ 使用传入参数计算安全半径（解决编译错误根源）
+            float safe_radius_world = obs.radius + uav_radius + safe_margin;
             float obs_radius_grid = safe_radius_world / GRID_RESOLUTION;
             int radius_int = static_cast<int>(std::ceil(obs_radius_grid));
 
-            // 3.3 圆形区域栅格更新（非方形，更符合物理）
             int gx_center = static_cast<int>(std::round(grid_x));
             int gy_center = static_cast<int>(std::round(grid_y));
 
@@ -327,16 +327,13 @@ bool vff_avoidance(
                     int gx = gx_center + dx;
                     int gy = gy_center + dy;
 
-                    // 边界检查
                     if (gx < 0 || gx >= GRID_SIZE || gy < 0 || gy >= GRID_SIZE)
                         continue;
 
-                    // 圆形区域判断（距离中心 <= 影响半径）
                     float dist_to_center = std::sqrt(dx * dx + dy * dy);
                     if (dist_to_center > obs_radius_grid)
                         continue;
 
-                    // 置信度更新：距离中心越近，置信度越高（线性衰减）
                     float weight = 1.0f - (dist_to_center / obs_radius_grid);
                     float increment = UPDATE_STRENGTH * weight;
 
@@ -346,9 +343,9 @@ bool vff_avoidance(
                 }
             }
         }
-    } // 栅格更新结束
+    }
 
-    // ========== 4. 力场计算：栅格置信度求和（VFF本质，非障碍物模型！） ==========
+    // ========== 4. 力场计算（使用传入参数） ==========
     struct ForceVector
     {
         float x, y;
@@ -371,9 +368,7 @@ bool vff_avoidance(
     };
 
     ForceVector repulsive_force;
-
-    // 4.1 仅计算前方扇形区域栅格（±90°，符合人类避障直觉）
-    float FRONT_HALF_ANGLE = M_PI_2; // 90度
+    float FRONT_HALF_ANGLE = M_PI_2;
 
     for (int i = 0; i < GRID_SIZE; ++i)
     {
@@ -381,20 +376,17 @@ bool vff_avoidance(
         {
             float certainty = certainty_grid[i][j];
             if (certainty < 5.0f)
-                continue; // 低置信度忽略
+                continue;
 
-            // 栅格中心相对无人机的世界坐标偏移
             float dx_grid = (i - GRID_SIZE / 2) * GRID_RESOLUTION;
             float dy_grid = (j - GRID_SIZE / 2) * GRID_RESOLUTION;
             float dist_to_grid = std::sqrt(dx_grid * dx_grid + dy_grid * dy_grid);
 
-            // 距离过滤：仅处理MIN_SAFE_DISTANCE~3.0米内栅格（太近不稳定，太远无效）
-            if (dist_to_grid < MIN_SAFE_DISTANCE || dist_to_grid > 3.0f)
+            // ✅ 使用传入的min_safe_distance
+            if (dist_to_grid < min_safe_distance || dist_to_grid > 3.0f)
                 continue;
 
-            // 角度过滤：仅前方±90°扇形（用机体航向角做投影）
             float angle_to_grid = std::atan2(dy_grid, dx_grid) - drone_yaw;
-            // 角度归一化到 [-π, π]
             while (angle_to_grid > M_PI)
                 angle_to_grid -= 2 * M_PI;
             while (angle_to_grid < -M_PI)
@@ -402,13 +394,11 @@ bool vff_avoidance(
             if (std::abs(angle_to_grid) > FRONT_HALF_ANGLE)
                 continue;
 
-            // 4.2 VFF核心公式：排斥力 ∝ 栅格置信度 / 距离²
-            // 注意：力场来源是栅格置信度分布，非障碍物几何模型！
+            // ✅ 使用传入的repulsive_gain和max_repulsive_force
             float force_mag = repulsive_gain * certainty / (dist_to_grid * dist_to_grid);
-            if (force_mag > MAX_REPULSIVE_FORCE)
-                force_mag = MAX_REPULSIVE_FORCE; // 防数值爆炸
+            if (force_mag > max_repulsive_force)
+                force_mag = max_repulsive_force; // 防数值爆炸
 
-            // 力方向：从栅格指向无人机（排斥力）
             float fx = (dx_grid / dist_to_grid) * force_mag;
             float fy = (dy_grid / dist_to_grid) * force_mag;
 
@@ -416,23 +406,14 @@ bool vff_avoidance(
         }
     }
 
-    // ========== 5. 吸引力场（恒定大小，指向目标） ==========
-    ForceVector attractive_force;
-    float ATTRACTIVE_MAG = 1.0f; // 恒定吸引力大小
-    attractive_force.add(
-        (dx_to_target / dist_to_target) * ATTRACTIVE_MAG,
-        (dy_to_target / dist_to_target) * ATTRACTIVE_MAG);
+    // ========== 5-9. 力场合成、速度调制、指令生成（使用传入参数） ==========
+    ForceVector attractive_force, total_force;
+    attractive_force.add((dx_to_target / dist_to_target) * 1.0f, (dy_to_target / dist_to_target) * 1.0f);
+    total_force.add(attractive_force.x - repulsive_force.x, attractive_force.y - repulsive_force.y);
 
-    // ========== 6. 力场合成 ==========
-    ForceVector total_force;
-    total_force.add(attractive_force.x - repulsive_force.x,
-                    attractive_force.y - repulsive_force.y);
-
-    // 特殊情况：力场为零（被障碍物包围）
     if (total_force.magnitude() < 0.01f)
     {
-        ROS_WARN("[VFF-GRID] 力场为零（可能被包围），启用沿墙走策略");
-        // 沿最近高置信度栅格的切线方向（简化版：45°偏移）
+        ROS_WARN("[VFF-GRID] 力场为零，启用沿墙走策略");
         total_force.x = std::cos(drone_yaw + M_PI_4);
         total_force.y = std::sin(drone_yaw + M_PI_4);
     }
@@ -441,54 +422,37 @@ bool vff_avoidance(
         total_force.normalize();
     }
 
-    // ========== 7. 速度调制（基于前方栅格最大置信度） ==========
-    // 原理：前方障碍物越密集（栅格置信度越高），速度越慢
     float max_certainty_ahead = 0.0f;
     for (int i = GRID_SIZE / 2; i < GRID_SIZE; ++i)
-    { // 仅前方栅格（X>0）
         for (int j = 0; j < GRID_SIZE; ++j)
-        {
             if (certainty_grid[i][j] > max_certainty_ahead)
-            {
                 max_certainty_ahead = certainty_grid[i][j];
-            }
-        }
-    }
 
-    // 置信度→速度映射：100%置信度 → 30%速度，0%置信度 → 100%速度
     float speed_factor = 1.0f - (max_certainty_ahead / 100.0f) * 0.7f;
     if (speed_factor < 0.3f)
-        speed_factor = 0.3f; // 最低30%速度保安全
-    float forward_speed = MAX_SPEED * speed_factor;
+        speed_factor = 0.3f;
 
-    // ========== 8. 生成避障指令 ==========
-    float TIME_STEP = 0.1f; // 100ms（匹配20Hz控制频率）
+    // ✅ 使用传入的max_speed
+    float forward_speed = max_speed * speed_factor;
+
+    float TIME_STEP = 0.1f;
     float safe_x = drone_x + total_force.x * forward_speed * TIME_STEP;
     float safe_y = drone_y + total_force.y * forward_speed * TIME_STEP;
 
-    // 安全边界：限制单步位移（防突变）
-    float step_dist = std::sqrt(
-        (safe_x - drone_x) * (safe_x - drone_x) +
-        (safe_y - drone_y) * (safe_y - drone_y));
-    if (step_dist > MAX_SPEED * TIME_STEP * 1.5f)
-    { // 1.5倍速保护
-        float scale = (MAX_SPEED * TIME_STEP * 1.5f) / step_dist;
+    float step_dist = std::sqrt((safe_x - drone_x) * (safe_x - drone_x) + (safe_y - drone_y) * (safe_y - drone_y));
+    if (step_dist > max_speed * TIME_STEP * 1.5f)
+    {
+        float scale = (max_speed * TIME_STEP * 1.5f) / step_dist;
         safe_x = drone_x + (safe_x - drone_x) * scale;
         safe_y = drone_y + (safe_y - drone_y) * scale;
     }
 
-    // 更新setpoint_raw（完整6DoF输出）
     setpoint_raw.position.x = safe_x;
     setpoint_raw.position.y = safe_y;
-    setpoint_raw.position.z = ALTITUDE; // 固定高度巡航
-    setpoint_raw.yaw = target_yaw;      // 保持任务航向
+    setpoint_raw.position.z = ALTITUDE;
+    setpoint_raw.yaw = target_yaw;
 
-    // ========== 9. 到达判断 ==========
-    float dist_now = std::sqrt(
-        (safe_x - target_x_world) * (safe_x - target_x_world) +
-        (safe_y - target_y_world) * (safe_y - target_y_world));
-
-    // 调试输出（分级：INFO级显示关键状态）
+    float dist_now = std::sqrt((safe_x - target_x_world) * (safe_x - target_x_world) + (safe_y - target_y_world) * (safe_y - target_y_world));
     ROS_INFO("[VFF-GRID] 目标(%.2f,%.2f) 避障点(%.2f,%.2f) 距离=%.2fm 速度=%.2fm/s 栅格峰值=%.0f",
              target_x_world, target_y_world, safe_x, safe_y, dist_now, forward_speed, max_certainty_ahead);
 

@@ -199,10 +199,18 @@ int main(int argc, char **argv)
     // 世界系前进（VFF避障巡航）
     case 2:
     {
-      // ========== VFF避障调用（参数已从yaml读取，直接使用全局变量） ==========
-      bool reached = vff_avoidance(target_x, target_y, target_yaw);
+      bool reached = vff_avoidance(
+          target_x,           // 目标X（相对）
+          target_y,           // 目标Y（相对）
+          target_yaw,         // 目标航向
+          UAV_radius,         // 无人机半径（来自yaml）
+          safe_margin,        // 安全裕度（来自yaml）
+          repulsive_gain,     // 排斥力增益（来自yaml）
+          MAX_SPEED,          // 最大速度（来自yaml）
+          MIN_SAFE_DISTANCE,  // 最小安全距离（来自yaml）
+          MAX_REPULSIVE_FORCE // 排斥力上限（来自yaml）
+      );
 
-      // ========== 任务完成判断 ==========
       ros::Duration elapsed = ros::Time::now() - last_request;
       if (reached || elapsed.toSec() > time_final)
       {
@@ -212,12 +220,11 @@ int main(int argc, char **argv)
         }
         else
         {
-          ROS_WARN("[VFF-GRID] 超时保护触发(%.1fs)，强制结束避障", elapsed.toSec());
+          ROS_WARN("[VFF-GRID] 超时保护触发(%.1fs)", elapsed.toSec());
         }
-        mission_num = 3; // 切换到降落任务
+        mission_num = 3;
         last_request = ros::Time::now();
       }
-      // 注意：vff_avoidance() 已直接修改 setpoint_raw，此处无需额外设置
       break;
     }
 
