@@ -383,10 +383,11 @@ bool vff_avoidance(
             float dist_to_grid = std::sqrt(dx_grid * dx_grid + dy_grid * dy_grid);
 
             // ✅ 使用传入的min_safe_distance
-            if (dist_to_grid < min_safe_distance || dist_to_grid > 3.0f)
+            if (dist_to_grid < min_safe_distance || dist_to_grid > 3.0f)//三米外的东西不考虑啦啦啦
                 continue;
-
+//仅仅关注前方的障碍物 
             float angle_to_grid = std::atan2(dy_grid, dx_grid) - drone_yaw;
+            // 将角度归一化到[-π, π]范围（核心：避免角度判断错误）
             while (angle_to_grid > M_PI)
                 angle_to_grid -= 2 * M_PI;
             while (angle_to_grid < -M_PI)
@@ -395,10 +396,13 @@ bool vff_avoidance(
                 continue;
 
             // ✅ 使用传入的repulsive_gain和max_repulsive_force
+            // 斥力大小核心公式：增益×危险值 / 距离平方
             float force_mag = repulsive_gain * certainty / (dist_to_grid * dist_to_grid);
+
+
             if (force_mag > max_repulsive_force)
                 force_mag = max_repulsive_force; // 防数值爆炸
-
+                                                 // 核心：将斥力大小分解为 x/y 方向的矢量分量
             float fx = (dx_grid / dist_to_grid) * force_mag;
             float fy = (dy_grid / dist_to_grid) * force_mag;
 
@@ -409,6 +413,7 @@ bool vff_avoidance(
     // ========== 5-9. 力场合成、速度调制、指令生成（使用传入参数） ==========
     ForceVector attractive_force, total_force;
     attractive_force.add((dx_to_target / dist_to_target) * 1.0f, (dy_to_target / dist_to_target) * 1.0f);
+    //引力大小一直为1.0f
     total_force.add(attractive_force.x - repulsive_force.x, attractive_force.y - repulsive_force.y);
 
     if (total_force.magnitude() < 0.01f)
@@ -419,9 +424,9 @@ bool vff_avoidance(
     }
     else
     {
-        total_force.normalize();
+        total_force.normalize(); // 总合力有效时，对其做归一化处理，转换为模长 1 的单位方向向量，仅保留方向信息
     }
-
+   // 遍历无人机正前方全部网格区域，找最大危险值
     float max_certainty_ahead = 0.0f;
     for (int i = GRID_SIZE / 2; i < GRID_SIZE; ++i)
         for (int j = 0; j < GRID_SIZE; ++j)
@@ -434,7 +439,7 @@ bool vff_avoidance(
 
     // ✅ 使用传入的max_speed
     float forward_speed = max_speed * speed_factor;
-
+//此处的force事实上只起到方向的控制作用，而forward_speed才是速度的大小
     float TIME_STEP = 0.1f;
     float safe_x = drone_x + total_force.x * forward_speed * TIME_STEP;
     float safe_y = drone_y + total_force.y * forward_speed * TIME_STEP;

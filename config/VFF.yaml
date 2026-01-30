@@ -2,15 +2,15 @@ err_max : 0.3
 if_debug : 1
 
 
-target_x : 6.6  
+target_x : 12.0  
 target_y : 0.0  
 
 target_yaw : 0.0
-UAV_radius : 0.4
-time_final : 40.0
+UAV_radius : 0.3
+time_final : 70.0
 
 MAX_SPEED : 1.0
-safe_margin : 0.6
+safe_margin : 0.2
 repulsive_gain : 2.0
-MIN_SAFE_DISTANCE : 0.2
+MIN_SAFE_DISTANCE : 0.1
 MAX_REPULSIVE_FORCE : 10.0
