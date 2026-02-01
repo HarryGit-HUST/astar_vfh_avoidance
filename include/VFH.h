@@ -799,7 +799,7 @@ bool vfh_avoidance(
     // 拥堵指数→速度映射：100%拥堵 → 30%速度
     float speed_factor = 1.0f - (max_forward_hist / histogram_threshold) * 0.7f;
     if (speed_factor < 0.3f)
-        speed_factor = 0.3f;
+        speed_factor = 0.5f;
     float forward_speed = max_speed * speed_factor;
 
     // 6.4 生成位置指令（100ms步长）

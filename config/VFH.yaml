@@ -10,13 +10,13 @@ target_yaw: 0.0
 time_final: 70.0
 
 # ===== 通用避障参数 =====
-UAV_radius: 0.35          # 无人机半径（含桨叶）
-safe_margin: 0.2          # 安全裕度（米）
+UAV_radius: 0.30          # 无人机半径（含桨叶）
+safe_margin: 0.02         # 安全裕度（米）
 MAX_SPEED: 3           # 最大速度（米/秒）
-MIN_SAFE_DISTANCE: 0.1   # 最小安全距离（米）
+MIN_SAFE_DISTANCE: 0.01   # 最小安全距离（米）
 
 # ===== VFH+专用参数（当USE_VFH_PLUS=true时生效） =====
-HISTOGRAM_THRESHOLD: 45.0 # 拥堵阈值（0~100，值越小越保守）
+HISTOGRAM_THRESHOLD: 70.0 # 拥堵阈值（0~100，值越小越保守）
 SMOOTHING_RADIUS: 2.5     # 平滑半径（扇区数，2~3最佳）
 
 # ===== VFF专用参数（当USE_VFH_PLUS=false时生效） =====
