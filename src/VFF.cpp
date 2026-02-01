@@ -91,7 +91,7 @@ int main(int argc, char **argv)
   nh.param<float>("target_yaw", target_yaw, 0.0f);
   nh.param<float>("UAV_radius", UAV_radius, 0.3f);
   nh.param<float>("time_final", time_final, 70.0f);
-  nh.param<float>("USE_VFH_PLUS", USE_VFH_PLUS, true); // 新增开关
+  nh.param<bool>("USE_VFH_PLUS", USE_VFH_PLUS, true); // 新增开关
 
   // 通用避障参数
   nh.param<float>("safe_margin", safe_margin, 0.5f);
