@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.0.2)
-project(VFF)
+project(VFH)
 
 ## Compile as C++11, supported in ROS Kinetic and newer
 # add_compile_options(-std=c++11)
@@ -33,5 +33,5 @@ include_directories(
 )
 
 
-add_executable(VFF src/VFF.cpp)
-target_link_libraries(VFF ${catkin_LIBRARIES} )
+add_executable(VFH src/VFH.cpp)
+target_link_libraries(VFH ${catkin_LIBRARIES} )

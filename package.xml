@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
 <package format="2">
-  <name>VFF</name>
+  <name>VFH</name>
   <version>0.1.0</version>
   <description>Fly control function library for drones</description>
   <maintainer email="hus-king@hust.edu.cn">Your Name</maintainer>
