@@ -1,4 +1,4 @@
-#include <VFF.h>
+#include <VFH.h>
 
 // 全局变量定义
 int mission_num = 0;
@@ -15,32 +15,47 @@ float target_yaw = 0.0f;   // 目标偏航角（弧度）
 float UAV_radius = 0.3f;   // 无人机等效半径（米）
 float time_final = 70.0f;  // 超时时间（秒）
 
-// VFF算法参数（全部从yaml读取，函数内直接使用）
+// VFF算法参数（全部从yaml读取）
 float safe_margin = 0.5f;          // 安全裕度（米）
-float repulsive_gain = 2.0f;       // 排斥力增益系数
+float repulsive_gain = 2.0f;       // 排斥力增益系数（VFF专用）
 float MAX_SPEED = 1.0f;            // 最大前进速度（米/秒）
 float MIN_SAFE_DISTANCE = 0.2f;    // 力场计算最小距离（防除零）
-float MAX_REPULSIVE_FORCE = 10.0f; // 排斥力上限（防数值爆炸）
+float MAX_REPULSIVE_FORCE = 10.0f; // 排斥力上限（VFF专用）
 
+// ========== 新增：VFH+专用参数 ==========
+float HISTOGRAM_THRESHOLD = 40.0f; // 直方图拥堵阈值（0~100）
+float SMOOTHING_RADIUS = 2.0f;     // 直方图平滑半径（扇区数）
+bool USE_VFH_PLUS = true;          // true=使用VFH+，false=使用VFF
 void print_param()
 {
   std::cout << "=== 控制参数 ===" << std::endl;
   std::cout << "err_max: " << err_max << std::endl;
   std::cout << "ALTITUDE: " << ALTITUDE << std::endl;
   std::cout << "if_debug: " << if_debug << std::endl;
-  if (if_debug == 1)
-    cout << "自动offboard" << std::endl;
-  else
-    cout << "遥控器offboard" << std::endl;
+  std::cout << "USE_VFH_PLUS: " << (USE_VFH_PLUS ? "true (VFH+)" : "false (VFF)") << std::endl;
 
-  // 打印VFF参数
-  std::cout << "=== VFF参数 ===" << std::endl;
-  std::cout << "UAV_radius: " << UAV_radius << std::endl;
-  std::cout << "safe_margin: " << safe_margin << std::endl;
-  std::cout << "repulsive_gain: " << repulsive_gain << std::endl;
-  std::cout << "MAX_SPEED: " << MAX_SPEED << std::endl;
-  std::cout << "MIN_SAFE_DISTANCE: " << MIN_SAFE_DISTANCE << std::endl;
-  std::cout << "MAX_REPULSIVE_FORCE: " << MAX_REPULSIVE_FORCE << std::endl;
+  if (if_debug == 1)
+    cout << "自动offboard + 详细避障调试日志" << std::endl;
+  else
+    cout << "遥控器offboard + 简洁日志" << std::endl;
+
+  // 打印避障参数
+  std::cout << "\n=== 避障参数（yaml配置） ===" << std::endl;
+  std::cout << "UAV_radius: " << UAV_radius << " m" << std::endl;
+  std::cout << "safe_margin: " << safe_margin << " m" << std::endl;
+  std::cout << "MAX_SPEED: " << MAX_SPEED << " m/s" << std::endl;
+  std::cout << "MIN_SAFE_DISTANCE: " << MIN_SAFE_DISTANCE << " m" << std::endl;
+
+  if (USE_VFH_PLUS)
+  {
+    std::cout << "HISTOGRAM_THRESHOLD: " << HISTOGRAM_THRESHOLD << " (拥堵阈值)" << std::endl;
+    std::cout << "SMOOTHING_RADIUS: " << SMOOTHING_RADIUS << " 扇区" << std::endl;
+  }
+  else
+  {
+    std::cout << "repulsive_gain: " << repulsive_gain << " (VFF排斥增益)" << std::endl;
+    std::cout << "MAX_REPULSIVE_FORCE: " << MAX_REPULSIVE_FORCE << " (VFF力上限)" << std::endl;
+  }
 }
 
 int main(int argc, char **argv)
@@ -49,7 +64,7 @@ int main(int argc, char **argv)
   setlocale(LC_ALL, "");
 
   // 初始化ROS节点
-  ros::init(argc, argv, "VFF");
+  ros::init(argc, argv, "VFH");
   ros::NodeHandle nh;
 
   // 订阅mavros相关话题
@@ -68,7 +83,7 @@ int main(int argc, char **argv)
   // 设置话题发布频率，需要大于2Hz，飞控连接有500ms的心跳包
   ros::Rate rate(20);
 
-  // 参数读取（全部映射到全局变量）
+  // ========== 参数读取（yaml → 全局变量） ==========
   nh.param<float>("err_max", err_max, 0);
   nh.param<float>("if_debug", if_debug, 0);
   nh.param<float>("target_x", target_x, 5.0f);
@@ -76,14 +91,20 @@ int main(int argc, char **argv)
   nh.param<float>("target_yaw", target_yaw, 0.0f);
   nh.param<float>("UAV_radius", UAV_radius, 0.3f);
   nh.param<float>("time_final", time_final, 70.0f);
+  nh.param<float>("USE_VFH_PLUS", USE_VFH_PLUS, true); // 新增开关
 
-  // VFF参数读取
+  // 通用避障参数
   nh.param<float>("safe_margin", safe_margin, 0.5f);
-  nh.param<float>("repulsive_gain", repulsive_gain, 2.0f);
   nh.param<float>("MAX_SPEED", MAX_SPEED, 1.0f);
   nh.param<float>("MIN_SAFE_DISTANCE", MIN_SAFE_DISTANCE, 0.2f);
+
+  // VFF专用参数（仅当USE_VFH_PLUS=false时使用）
+  nh.param<float>("repulsive_gain", repulsive_gain, 2.0f);
   nh.param<float>("MAX_REPULSIVE_FORCE", MAX_REPULSIVE_FORCE, 10.0f);
 
+  // VFH+专用参数（仅当USE_VFH_PLUS=true时使用）
+  nh.param<float>("HISTOGRAM_THRESHOLD", HISTOGRAM_THRESHOLD, 40.0f);
+  nh.param<float>("SMOOTHING_RADIUS", SMOOTHING_RADIUS, 2.0f);
   print_param();
 
   int choice = 0;
@@ -196,31 +217,52 @@ int main(int argc, char **argv)
       break;
     }
 
-    // 世界系前进（VFF避障巡航）
+      // 世界系前进（智能避障：VFH+ 或 VFF）
     case 2:
     {
-      bool reached = vff_avoidance(
-          target_x,           // 目标X（相对）
-          target_y,           // 目标Y（相对）
-          target_yaw,         // 目标航向
-          UAV_radius,         // 无人机半径（来自yaml）
-          safe_margin,        // 安全裕度（来自yaml）
-          repulsive_gain,     // 排斥力增益（来自yaml）
-          MAX_SPEED,          // 最大速度（来自yaml）
-          MIN_SAFE_DISTANCE,  // 最小安全距离（来自yaml）
-          MAX_REPULSIVE_FORCE // 排斥力上限（来自yaml）
-      );
+      bool reached = false;
 
+      if (USE_VFH_PLUS)
+      {
+        // ========== VFH+调用（推荐） ==========
+        reached = vfh_avoidance(
+            target_x,            // 目标X（相对）
+            target_y,            // 目标Y（相对）
+            target_yaw,          // 目标航向
+            UAV_radius,          // 无人机半径
+            safe_margin,         // 安全裕度
+            MAX_SPEED,           // 最大速度
+            MIN_SAFE_DISTANCE,   // 最小安全距离
+            HISTOGRAM_THRESHOLD, // 拥堵阈值
+            SMOOTHING_RADIUS     // 平滑半径
+        );
+      }
+      else
+      {
+        // ========== VFF调用（兼容旧版） ==========
+        reached = vff_avoidance(
+            target_x,
+            target_y,
+            target_yaw,
+            UAV_radius,
+            safe_margin,
+            repulsive_gain,
+            MAX_SPEED,
+            MIN_SAFE_DISTANCE,
+            MAX_REPULSIVE_FORCE);
+      }
+
+      // 任务完成判断
       ros::Duration elapsed = ros::Time::now() - last_request;
       if (reached || elapsed.toSec() > time_final)
       {
         if (reached)
         {
-          ROS_WARN("[VFF-GRID] 成功抵达目标点(%.2f, %.2f)!", target_x, target_y);
+          ROS_WARN("[避障] ✓ 成功抵达目标点(%.2f, %.2f)!", target_x, target_y);
         }
         else
         {
-          ROS_WARN("[VFF-GRID] 超时保护触发(%.1fs)", elapsed.toSec());
+          ROS_WARN("[避障] ✗ 超时保护触发(%.1fs)，强制结束", elapsed.toSec());
         }
         mission_num = 3;
         last_request = ros::Time::now();

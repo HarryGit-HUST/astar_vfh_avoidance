@@ -1,5 +1,0 @@
-<launch>
-  <node pkg="VFF" type="VFF" name="" output="screen">
-    <rosparam command="load" file="$(find VFF)/config/VFF.yaml" />
-  </node>
-</launch>
