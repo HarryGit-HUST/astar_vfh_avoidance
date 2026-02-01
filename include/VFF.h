@@ -383,7 +383,7 @@ bool vff_avoidance(
             float dist_to_grid = std::sqrt(dx_grid * dx_grid + dy_grid * dy_grid);
 
             // ✅ 使用传入的min_safe_distance
-            if (dist_to_grid < min_safe_distance || dist_to_grid > 3.0f)//三米外的东西不考虑啦啦啦
+            if (dist_to_grid < min_safe_distance || dist_to_grid > 2.0f)//两米外的东西不考虑啦啦啦
                 continue;
 //仅仅关注前方的障碍物 
             float angle_to_grid = std::atan2(dy_grid, dx_grid) - drone_yaw;
@@ -440,7 +440,7 @@ bool vff_avoidance(
     // ✅ 使用传入的max_speed
     float forward_speed = max_speed * speed_factor;
 //此处的force事实上只起到方向的控制作用，而forward_speed才是速度的大小
-    float TIME_STEP = 0.3f;
+    float TIME_STEP = 0.1f;
     float safe_x = drone_x + total_force.x * forward_speed * TIME_STEP;
     float safe_y = drone_y + total_force.y * forward_speed * TIME_STEP;
 

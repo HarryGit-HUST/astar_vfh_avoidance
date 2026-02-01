@@ -13,4 +13,4 @@ MAX_SPEED : 3.0
 safe_margin : 0.1
 repulsive_gain : 2.0
 MIN_SAFE_DISTANCE : 0.1
-MAX_REPULSIVE_FORCE : 10.0
+MAX_REPULSIVE_FORCE : 8.0
