@@ -1,5 +1,0 @@
-<launch>
-  <node pkg="VFH" type="VFH" name="" output="screen">
-    <rosparam command="load" file="$(find VFH)/config/VFH.yaml" />
-  </node>
-</launch>

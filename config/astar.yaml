@@ -1,0 +1,32 @@
+# ===== 基础参数 =====
+err_max: 0.2
+if_debug: 1  # 0=简洁日志, 1=详细调试日志
+
+# ===== 任务参数 =====
+target_x: 5.0      # 目标点X（相对起飞点，米）
+target_y: 0.0      # 目标点Y（相对起飞点，米）
+target_yaw: 0.0    # 目标航向（弧度）
+time_final: 70.0   # 任务超时时间（秒）
+
+# ===== 无人机参数 =====
+UAV_radius: 0.35   # 无人机半径（含桨叶，米）
+
+# ===== 避障核心参数 =====
+safe_margin: 0.4        # 安全裕度（米）
+MAX_SPEED: 0.9          # 最大速度（米/秒）
+MIN_SAFE_DISTANCE: 0.25 # 力场最小距离（米）
+CORRIDOR_WIDTH_BASE: 0.8 # 基础走廊宽度（米）
+ENABLE_CORRIDOR: true   # 是否启用走廊约束
+
+# ===== 重规划参数 =====
+FRONT_OBSTACLE_TH: 2    # 死胡同检测：前方障碍物阈值
+BACK_OBSTACLE_TH: 1     # 死胡同检测：后方障碍物阈值
+DETECTION_RADIUS: 1.5   # 检测半径（米）
+REPLAN_COOLDOWN: 5.0    # 重规划冷却时间（秒，防频繁触发）
+
+# ===== 调参指南 =====
+# 场景          | CORRIDOR_WIDTH_BASE | MAX_SPEED | FRONT_OBSTACLE_TH
+# --------------|---------------------|-----------|-------------------
+# 开阔场地      | 1.0                 | 1.2       | 3
+# 窄通道(1.5m)  | 0.7                 | 0.7       | 1
+# 默认值        | 0.8                 | 0.9       | 2

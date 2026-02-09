@@ -1,0 +1,5 @@
+<launch>
+  <node pkg="astar" type="astar" name="" output="screen">
+    <rosparam command="load" file="$(find astar)/config/astar.yaml" />
+  </node>
+</launch>
