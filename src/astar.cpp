@@ -1,4 +1,20 @@
-#include <atsar.h>
+#include <astar.h>
+
+// ========== 任务状态机定义（关键：避免与mavros_msgs::State冲突） ==========
+enum AvoidanceState
+{
+  INIT,       // 初始化
+  TAKEOFF,    // 起飞
+  PLANNING,   // A*全局规划
+  AVOIDING,   // VFH+避障中
+  REPLANNING, // A*重规划中
+  LANDING,    // 降落
+  EMERGENCY   // 紧急悬停
+};
+
+AvoidanceState avoidance_state = INIT; // 独立状态机变量
+ros::Time state_start_time;
+ros::Time last_replan_time;
 
 // 全局变量定义
 int mission_num = 0;
@@ -26,23 +42,7 @@ bool ENABLE_CORRIDOR = true;
 int FRONT_OBSTACLE_TH = 2;
 int BACK_OBSTACLE_TH = 1;
 float DETECTION_RADIUS = 1.5f;
-float REPLAN_COOLDOWN = 5.0f; // 重规划冷却时间（秒）
-
-// ========== 状态机定义 ==========
-enum MissionState
-{
-  INIT,       // 初始化
-  TAKEOFF,    // 起飞
-  PLANNING,   // A*全局规划
-  AVOIDING,   // VFH+避障中
-  REPLANNING, // A*重规划中
-  LANDING,    // 降落
-  EMERGENCY   // 紧急悬停
-};
-
-MissionState current_state = INIT;
-ros::Time state_start_time;
-ros::Time last_replan_time;
+float REPLAN_COOLDOWN = 5.0f;
 
 // 路径与走廊数据
 const int MAX_PATH_POINTS = 200;
@@ -116,7 +116,7 @@ int main(int argc, char **argv)
   rate.sleep();
 
   // 等待飞控连接
-  while (ros::ok() && !current_state.connected)
+  while (ros::ok() && !mavros_connection_state.connected)
   {
     ros::spinOnce();
     rate.sleep();
@@ -148,22 +148,21 @@ int main(int argc, char **argv)
   while (ros::ok())
   {
     ROS_WARN("[STATE] Current state: %d (%s), mission_num=%d",
-             current_state,
-             (current_state == INIT ? "INIT" : current_state == TAKEOFF  ? "TAKEOFF"
-                                           : current_state == PLANNING   ? "PLANNING"
-                                           : current_state == AVOIDING   ? "AVOIDING"
-                                           : current_state == REPLANNING ? "REPLANNING"
-                                           : current_state == LANDING    ? "LANDING"
-                                                                         : "EMERGENCY"),
+             avoidance_state,
+             (avoidance_state == INIT ? "INIT" : avoidance_state == TAKEOFF  ? "TAKEOFF"
+                                             : avoidance_state == PLANNING   ? "PLANNING"
+                                             : avoidance_state == AVOIDING   ? "AVOIDING"
+                                             : avoidance_state == REPLANNING ? "REPLANNING"
+                                             : avoidance_state == LANDING    ? "LANDING"
+                                                                             : "EMERGENCY"),
              mission_num);
 
-    switch (current_state)
+    switch (avoidance_state)
     {
     case INIT:
-      // 初始化：等待起飞高度
       if (fabs(local_pos.pose.pose.position.z - ALTITUDE) < 0.2)
       {
-        current_state = TAKEOFF;
+        avoidance_state = TAKEOFF;
         state_start_time = ros::Time::now();
         ROS_INFO("[STATE] Switched to TAKEOFF");
       }
@@ -171,184 +170,172 @@ int main(int argc, char **argv)
       break;
 
     case TAKEOFF:
-      // 起飞：悬停3秒
       if (mission_pos_cruise(0, 0, ALTITUDE, 0, err_max))
       {
-        current_state = PLANNING;
+        avoidance_state = PLANNING;
         state_start_time = ros::Time::now();
         ROS_INFO("[STATE] Switched to PLANNING");
       }
       else if ((ros::Time::now() - state_start_time).toSec() > 3.0)
       {
-        current_state = PLANNING;
+        avoidance_state = PLANNING;
         state_start_time = ros::Time::now();
         ROS_INFO("[STATE] Switched to PLANNING (timeout)");
       }
       break;
 
     case PLANNING:
-      // A*全局规划
+    {
+      OccupancyGrid2D grid;
+      grid.update_with_obstacles(obstacles, UAV_radius, safe_margin);
+
+      float goal_x_world = init_position_x_take_off + target_x;
+      float goal_y_world = init_position_y_take_off + target_y;
+
+      path_size = astar_plan(
+          grid,
+          local_pos.pose.pose.position.x,
+          local_pos.pose.pose.position.y,
+          goal_x_world,
+          goal_y_world,
+          astar_path_x,
+          astar_path_y,
+          MAX_PATH_POINTS);
+
+      if (path_size > 0)
       {
-        OccupancyGrid2D grid;
-        grid.update_with_obstacles(obstacles, UAV_radius, safe_margin);
+        corridor_size = generate_corridor(
+            astar_path_x, astar_path_y,
+            path_size,
+            CORRIDOR_WIDTH_BASE,
+            corridor_x, corridor_y,
+            corridor_width,
+            MAX_CORRIDOR_POINTS);
 
-        float goal_x_world = init_position_x_take_off + target_x;
-        float goal_y_world = init_position_y_take_off + target_y;
-
-        path_size = astar_plan(
-            grid,
-            local_pos.pose.pose.position.x,
-            local_pos.pose.pose.position.y,
-            goal_x_world,
-            goal_y_world,
-            astar_path_x,
-            astar_path_y,
-            MAX_PATH_POINTS);
-
-        if (path_size > 0)
+        if (corridor_size > 0)
         {
-          // 生成走廊
-          corridor_size = generate_corridor(
-              astar_path_x, astar_path_y,
-              path_size,
-              CORRIDOR_WIDTH_BASE,
-              corridor_x, corridor_y,
-              corridor_width,
-              MAX_CORRIDOR_POINTS);
-
-          if (corridor_size > 0)
-          {
-            current_state = AVOIDING;
-            state_start_time = ros::Time::now();
-            ROS_INFO("[STATE] Switched to AVOIDING (path_size=%d, corridor_size=%d)",
-                     path_size, corridor_size);
-          }
-          else
-          {
-            ROS_ERROR("[STATE] Corridor generation failed!");
-            current_state = EMERGENCY;
-          }
+          avoidance_state = AVOIDING;
+          state_start_time = ros::Time::now();
+          ROS_INFO("[STATE] Switched to AVOIDING (path_size=%d, corridor_size=%d)",
+                   path_size, corridor_size);
         }
         else
         {
-          ROS_ERROR("[STATE] A* planning failed!");
-          current_state = EMERGENCY;
+          ROS_ERROR("[STATE] Corridor generation failed!");
+          avoidance_state = EMERGENCY;
         }
       }
-      break;
+      else
+      {
+        ROS_ERROR("[STATE] A* planning failed!");
+        avoidance_state = EMERGENCY;
+      }
+    }
+    break;
 
     case AVOIDING:
-      // VFH+避障主循环
+    {
+      bool need_replan = false;
+      bool reached = vfh_plus_with_corridor(
+          target_x, target_y, target_yaw,
+          UAV_radius, safe_margin, MAX_SPEED, MIN_SAFE_DISTANCE,
+          corridor_x, corridor_y, corridor_width, corridor_size,
+          ENABLE_CORRIDOR,
+          need_replan);
+
+      ros::Duration elapsed = ros::Time::now() - state_start_time;
+      if (elapsed.toSec() > time_final)
       {
-        bool need_replan = false;
-        bool reached = vfh_plus_with_corridor(
-            target_x, target_y, target_yaw,
-            UAV_radius, safe_margin, MAX_SPEED, MIN_SAFE_DISTANCE,
-            corridor_x, corridor_y, corridor_width, corridor_size,
-            ENABLE_CORRIDOR,
-            need_replan);
-
-        // 定时跳转：超时保护
-        ros::Duration elapsed = ros::Time::now() - state_start_time;
-        if (elapsed.toSec() > time_final)
-        {
-          ROS_WARN("[STATE] Mission timeout (%.1fs), switching to LANDING", elapsed.toSec());
-          current_state = LANDING;
-          state_start_time = ros::Time::now();
-          break;
-        }
-
-        // 重规划触发
-        if (need_replan && (ros::Time::now() - last_replan_time).toSec() > REPLAN_COOLDOWN)
-        {
-          ROS_WARN("[STATE] Replanning triggered!");
-          current_state = REPLANNING;
-          state_start_time = ros::Time::now();
-          last_replan_time = ros::Time::now();
-          break;
-        }
-
-        // 到达目标
-        if (reached)
-        {
-          ROS_WARN("[STATE] Target reached!");
-          current_state = LANDING;
-          state_start_time = ros::Time::now();
-        }
+        ROS_WARN("[STATE] Mission timeout (%.1fs), switching to LANDING", elapsed.toSec());
+        avoidance_state = LANDING;
+        state_start_time = ros::Time::now();
+        break;
       }
-      break;
+
+      if (need_replan && (ros::Time::now() - last_replan_time).toSec() > REPLAN_COOLDOWN)
+      {
+        ROS_WARN("[STATE] Replanning triggered!");
+        avoidance_state = REPLANNING;
+        state_start_time = ros::Time::now();
+        last_replan_time = ros::Time::now();
+        break;
+      }
+
+      if (reached)
+      {
+        ROS_WARN("[STATE] Target reached!");
+        avoidance_state = LANDING;
+        state_start_time = ros::Time::now();
+      }
+    }
+    break;
 
     case REPLANNING:
-      // A*重规划（同PLANNING，但使用当前位置作为起点）
+    {
+      OccupancyGrid2D grid;
+      grid.update_with_obstacles(obstacles, UAV_radius, safe_margin);
+
+      float goal_x_world = init_position_x_take_off + target_x;
+      float goal_y_world = init_position_y_take_off + target_y;
+
+      path_size = astar_plan(
+          grid,
+          local_pos.pose.pose.position.x,
+          local_pos.pose.pose.position.y,
+          goal_x_world,
+          goal_y_world,
+          astar_path_x,
+          astar_path_y,
+          MAX_PATH_POINTS);
+
+      if (path_size > 0)
       {
-        OccupancyGrid2D grid;
-        grid.update_with_obstacles(obstacles, UAV_radius, safe_margin);
+        corridor_size = generate_corridor(
+            astar_path_x, astar_path_y,
+            path_size,
+            CORRIDOR_WIDTH_BASE,
+            corridor_x, corridor_y,
+            corridor_width,
+            MAX_CORRIDOR_POINTS);
 
-        float goal_x_world = init_position_x_take_off + target_x;
-        float goal_y_world = init_position_y_take_off + target_y;
-
-        path_size = astar_plan(
-            grid,
-            local_pos.pose.pose.position.x, // 当前位置作为新起点
-            local_pos.pose.pose.position.y,
-            goal_x_world,
-            goal_y_world,
-            astar_path_x,
-            astar_path_y,
-            MAX_PATH_POINTS);
-
-        if (path_size > 0)
+        if (corridor_size > 0)
         {
-          corridor_size = generate_corridor(
-              astar_path_x, astar_path_y,
-              path_size,
-              CORRIDOR_WIDTH_BASE,
-              corridor_x, corridor_y,
-              corridor_width,
-              MAX_CORRIDOR_POINTS);
-
-          if (corridor_size > 0)
-          {
-            current_state = AVOIDING;
-            state_start_time = ros::Time::now();
-            ROS_INFO("[STATE] Replanning success, switched to AVOIDING");
-          }
-          else
-          {
-            ROS_ERROR("[STATE] Corridor generation failed after replanning!");
-            current_state = EMERGENCY;
-          }
+          avoidance_state = AVOIDING;
+          state_start_time = ros::Time::now();
+          ROS_INFO("[STATE] Replanning success, switched to AVOIDING");
         }
         else
         {
-          ROS_ERROR("[STATE] A* replanning failed!");
-          // 降级：禁用走廊，仅用VFH+避障
-          ENABLE_CORRIDOR = false;
-          current_state = AVOIDING;
-          state_start_time = ros::Time::now();
-          ROS_WARN("[STATE] Degraded to VFH+ only (no corridor)");
+          ROS_ERROR("[STATE] Corridor generation failed after replanning!");
+          avoidance_state = EMERGENCY;
         }
       }
-      break;
+      else
+      {
+        ROS_ERROR("[STATE] A* replanning failed!");
+        ENABLE_CORRIDOR = false;
+        avoidance_state = AVOIDING;
+        state_start_time = ros::Time::now();
+        ROS_WARN("[STATE] Degraded to VFH+ only (no corridor)");
+      }
+    }
+    break;
 
     case LANDING:
-      // 降落
       if (precision_land(err_max))
       {
         ROS_WARN("[STATE] Landing complete, mission success!");
-        mission_num = -1; // 任务结束
+        mission_num = -1;
       }
       break;
 
     case EMERGENCY:
-      // 紧急悬停
       setpoint_raw.position.x = local_pos.pose.pose.position.x;
       setpoint_raw.position.y = local_pos.pose.pose.position.y;
       setpoint_raw.position.z = ALTITUDE;
       setpoint_raw.yaw = target_yaw;
 
       ROS_ERROR("[STATE] EMERGENCY MODE: Hovering at current position");
-      // 人工干预后恢复
       if (mission_num == -1)
       {
         exit(0);
@@ -356,7 +343,6 @@ int main(int argc, char **argv)
       break;
     }
 
-    // 发布控制指令
     mavros_setpoint_pos_pub.publish(setpoint_raw);
     ros::spinOnce();
     rate.sleep();
