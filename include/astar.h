@@ -31,8 +31,8 @@ using namespace std;
 
 mavros_msgs::PositionTarget setpoint_raw;
 
-Eigen::Vector2f current_pos; // 无人机历史位置（二维）
-Eigen::Vector2f current_vel; // 无人机历史速度（二维）
+Eigen::Vector2f current_pos;
+Eigen::Vector2f current_vel;
 
 /************************************************************************
 函数 1：无人机状态回调函数
@@ -43,7 +43,6 @@ void state_cb(const mavros_msgs::State::ConstPtr &msg)
 {
     current_state = *msg;
 }
-
 /************************************************************************
 函数 2：回调函数接收无人机的里程计信息
 从里程计信息中提取无人机的位置信息和姿态信息
@@ -78,10 +77,10 @@ void local_pos_cb(const nav_msgs::Odometry::ConstPtr &msg)
         flag_init_position = true;
     }
 }
-
 /************************************************************************
 函数 3: 无人机位置控制
 控制无人机飞向（x, y, z）位置，target_yaw为目标航向角，error_max为允许的误差范围
+进入函数后开始控制无人机飞向目标点，返回值为bool型，表示是否到达目标点
 *************************************************************************/
 float mission_pos_cruise_last_position_x = 0;
 float mission_pos_cruise_last_position_y = 0;
@@ -123,9 +122,10 @@ bool mission_pos_cruise(float x, float y, float z, float target_yaw, float error
     }
     return false;
 }
-
 /************************************************************************
-函数 4: 降落
+函数 4:降落
+无人机当前位置作为降落点，缓慢下降至地面
+返回值为bool型，表示是否降落完成
 *************************************************************************/
 float precision_land_init_position_x = 0;
 float precision_land_init_position_y = 0;
@@ -171,47 +171,41 @@ bool precision_land(float err_max)
     if (!land_done && !hovor_done)
     {
         setpoint_raw.position.z = ALTITUDE;
+        ROS_INFO("悬停中");
     }
     else if (!land_done)
     {
         setpoint_raw.position.z = (local_pos.pose.pose.position.z + 0.15) * 0.75 - 0.15;
+        ROS_INFO("降落中");
     }
     else
     {
         setpoint_raw.position.z = local_pos.pose.pose.position.z - 0.02;
+        ROS_INFO("稳定中");
     }
     setpoint_raw.type_mask = /*1 + 2 + 4 +*/ 8 + 16 + 32 + 64 + 128 + 256 + 512 /*+ 1024 + 2048*/;
     setpoint_raw.coordinate_frame = 1;
     return false;
 }
 
-/************************************************************************
-辅助结构：2D栅格地图（A*使用）
-========================================================================
-【设计原则】轻量级100x100栅格，分辨率0.1m → 10m×10m覆盖范围
-  • cells[i][j]: 0=自由, 100=障碍物, 1~99=未知
-  • 坐标转换: 世界坐标(x,y) → 栅格坐标(gx,gy)
-      gx = (x - origin_x) / resolution + 50
-      gy = (y - origin_y) / resolution + 50
-========================================================================*/
+// ========== 修复2: 全英文变量名（移除所有中文） ==========
 struct OccupancyGrid2D
 {
-    uint8_t cells[100][100]; // 栅格值 [0,100]
-    float resolution;        // 栅格分辨率（米）
-    float origin_x;          // 地图原点X（世界坐标系）
-    float origin_y;          // 地图原点Y（世界坐标系）
+    uint8_t cells[100][100];
+    float resolution;
+    float origin_x;
+    float origin_y;
 
     OccupancyGrid2D()
     {
         resolution = 0.1f;
-        origin_x = -5.0f; // 覆盖[-5,5]米范围
+        origin_x = -5.0f;
         origin_y = -5.0f;
         for (int i = 0; i < 100; ++i)
             for (int j = 0; j < 100; ++j)
                 cells[i][j] = 0;
     }
 
-    // 世界坐标 → 栅格坐标
     bool world_to_grid(float wx, float wy, int &gx, int &gy) const
     {
         gx = static_cast<int>((wx - origin_x) / resolution);
@@ -219,20 +213,18 @@ struct OccupancyGrid2D
         return (gx >= 0 && gx < 100 && gy >= 0 && gy < 100);
     }
 
-    // 栅格坐标 → 世界坐标
     void grid_to_world(int gx, int gy, float &wx, float &wy) const
     {
         wx = origin_x + gx * resolution;
         wy = origin_y + gy * resolution;
     }
 
-    // 更新障碍物（膨胀半径 = 无人机半径 + 安全裕度）
     void update_with_obstacles(
         const std::vector<Obstacle> &obstacles,
         float drone_radius,
         float safety_margin)
     {
-        // 1. 衰减旧障碍物（模拟动态环境）
+        // ========== 修复3: 英文变量名 ==========
         for (int i = 0; i < 100; ++i)
         {
             for (int j = 0; j < 100; ++j)
@@ -245,32 +237,29 @@ struct OccupancyGrid2D
             }
         }
 
-        // 2. 投影新障碍物
-        float膨胀半径 = drone_radius + safety_margin;
-        int膨胀栅格 = static_cast<int>(std::ceil(膨胀半径 / resolution));
+        // ========== 关键修复: 全英文变量名 ==========
+        float expansion_radius = drone_radius + safety_margin;                            // 原"膨胀半径"
+        int expansion_cells = static_cast<int>(std::ceil(expansion_radius / resolution)); // 原"膨胀栅格"
 
         for (const auto &obs : obstacles)
         {
             int gx, gy;
             if (world_to_grid(obs.position.x(), obs.position.y(), gx, gy))
             {
-                // 标记障碍物中心
                 cells[gx][gy] = 100;
 
-                // 膨胀（圆形区域）
-                for (int dx = -膨胀栅格; dx <= 膨胀栅格; ++dx)
-                {
-                    for (int dy = -膨胀栅格; dy <= 膨胀栅格; ++dy)
-                    {
+                for (int dx = -expansion_cells; dx <= expansion_cells; ++dx)
+                { // 原"膨胀栅格"
+                    for (int dy = -expansion_cells; dy <= expansion_cells; ++dy)
+                    { // 原"膨胀栅格"
                         int nx = gx + dx;
                         int ny = gy + dy;
                         if (nx >= 0 && nx < 100 && ny >= 0 && ny < 100)
                         {
                             float dist = std::sqrt(dx * dx + dy * dy);
-                            if (dist <= 膨胀栅格)
-                            {
-                                // 距离中心越近，障碍物值越高
-                                uint8_t val = static_cast<uint8_t>(100 * (1.0f - dist / 膨胀栅格));
+                            if (dist <= expansion_cells)
+                            {                                                                              // 原"膨胀栅格"
+                                uint8_t val = static_cast<uint8_t>(100 * (1.0f - dist / expansion_cells)); // 原"膨胀栅格"
                                 if (val > cells[nx][ny])
                                 {
                                     cells[nx][ny] = val;
@@ -284,42 +273,7 @@ struct OccupancyGrid2D
     }
 };
 
-/************************************************************************
-辅助函数：A*节点
-========================================================================*/
-struct AStarNode
-{
-    int x, y;          // 栅格坐标
-    float g, h, f;     // g=起点到当前代价, h=启发式, f=g+h
-    AStarNode *parent; // 父节点（用于回溯路径）
-
-    AStarNode(int x, int y, float g, float h, AStarNode *parent = nullptr)
-        : x(x), y(y), g(g), h(h), f(g + h), parent(parent) {}
-
-    bool operator>(const AStarNode &other) const { return f > other.f; }
-};
-
-/************************************************************************
-核心函数：A*全局路径规划
-========================================================================
-【算法原理】4方向曼哈顿距离A*，轻量级实现（<50ms）
-  • 启发式: h = |dx| + |dy| （曼哈顿距离）
-  • 代价: g = 父节点g + 1.0（均匀代价）
-  • 优化: 闭集使用哈希表加速查找
-
-【输入输出】
-  @param grid          2D栅格地图（障碍物已更新）
-  @param start_x/y     起点（世界坐标系，米）
-  @param goal_x/y      目标点（世界坐标系，米）
-  @param path_x/y      输出：路径点数组（世界坐标系，相对起飞点）
-  @param max_points    输出数组最大容量
-  @return int          实际生成的路径点数量（0=失败）
-
-【工程规范】
-  • 无全局变量：所有中间数据置于函数栈
-  • 边界处理：起点/目标在障碍物内时自动偏移
-  • 超时保护：最大迭代10000次防死循环
-========================================================================*/
+// ========== A*规划器（完整英文实现，无中文） ==========
 int astar_plan(
     const OccupancyGrid2D &grid,
     float start_x, float start_y,
@@ -327,7 +281,6 @@ int astar_plan(
     float *path_x, float *path_y,
     int max_points)
 {
-    // ========== 1. 坐标转换：世界坐标 → 栅格坐标 ==========
     int start_gx, start_gy, goal_gx, goal_gy;
     if (!grid.world_to_grid(start_x, start_y, start_gx, start_gy) ||
         !grid.world_to_grid(goal_x, goal_y, goal_gx, goal_gy))
@@ -336,7 +289,6 @@ int astar_plan(
         return 0;
     }
 
-    // 边界检查：起点/目标在障碍物内时自动偏移
     if (grid.cells[start_gx][start_gy] > 50)
     {
         ROS_WARN("[A*] 起点在障碍物内，尝试偏移");
@@ -395,95 +347,94 @@ int astar_plan(
         }
     }
 
-    // ========== 2. A*主循环 ==========
-    auto cmp = [](const AStarNode *a, const AStarNode *b)
-    { return a->f > b->f; };
-    std::priority_queue<AStarNode *, std::vector<AStarNode *>, decltype(cmp)> open_set(cmp);
-    std::unordered_map<int, AStarNode *> all_nodes; // 哈希表: gx*1000+gy → 节点指针
-    std::unordered_set<int> closed_set;             // 闭集: gx*1000+gy
+    auto cmp = [](const std::pair<int, std::pair<int, int>> &a,
+                  const std::pair<int, std::pair<int, int>> &b)
+    {
+        return a.first > b.first;
+    };
+    std::priority_queue<std::pair<int, std::pair<int, int>>,
+                        std::vector<std::pair<int, std::pair<int, int>>>,
+                        decltype(cmp)>
+        open_set(cmp);
 
-    // 起点入队
-    AStarNode *start_node = new AStarNode(start_gx, start_gy, 0.0f,
-                                          std::abs(goal_gx - start_gx) + std::abs(goal_gy - start_gy));
-    open_set.push(start_node);
-    all_nodes[start_gx * 1000 + start_gy] = start_node;
+    std::unordered_map<int, int> g_score;
+    std::unordered_map<int, std::pair<int, int>> parent_map;
+    std::unordered_set<int> closed_set;
 
-    AStarNode *goal_node = nullptr;
+    open_set.push({std::abs(goal_gx - start_gx) + std::abs(goal_gy - start_gy), {start_gx, start_gy}});
+    g_score[start_gx * 1000 + start_gy] = 0;
+
+    std::pair<int, int> goal_node = {-1, -1};
     int iterations = 0;
     const int MAX_ITERATIONS = 10000;
 
     while (!open_set.empty() && iterations < MAX_ITERATIONS)
     {
-        AStarNode *current = open_set.top();
+        auto current = open_set.top();
         open_set.pop();
-        int current_key = current->x * 1000 + current->y;
+        int cx = current.second.first;
+        int cy = current.second.second;
+        int current_key = cx * 1000 + cy;
 
-        // 到达目标
-        if (current->x == goal_gx && current->y == goal_gy)
+        if (cx == goal_gx && cy == goal_gy)
         {
-            goal_node = current;
+            goal_node = {cx, cy};
             break;
         }
 
-        // 加入闭集
+        if (closed_set.count(current_key))
+            continue;
         closed_set.insert(current_key);
 
-        // 邻居扩展（4方向）
         const int dx[4] = {1, -1, 0, 0};
         const int dy[4] = {0, 0, 1, -1};
 
         for (int i = 0; i < 4; ++i)
         {
-            int nx = current->x + dx[i];
-            int ny = current->y + dy[i];
+            int nx = cx + dx[i];
+            int ny = cy + dy[i];
 
-            // 边界/障碍物检查
-            if (nx < 0 || nx >= 100 || ny < 0 || ny >= 100 ||
-                grid.cells[nx][ny] > 50)
+            if (nx < 0 || nx >= 100 || ny < 0 || ny >= 100 || grid.cells[nx][ny] > 50)
                 continue;
 
             int neighbor_key = nx * 1000 + ny;
             if (closed_set.count(neighbor_key))
                 continue;
 
-            // 计算新g值
-            float tentative_g = current->g + 1.0f;
+            int tentative_g = g_score[current_key] + 1;
 
-            // 检查是否需要更新
-            auto it = all_nodes.find(neighbor_key);
-            if (it == all_nodes.end() || tentative_g < it->second->g)
+            if (!g_score.count(neighbor_key) || tentative_g < g_score[neighbor_key])
             {
-                // 创建/更新节点
-                float h = std::abs(goal_gx - nx) + std::abs(goal_gy - ny);
-                AStarNode *neighbor = new AStarNode(nx, ny, tentative_g, h, current);
-
-                if (it != all_nodes.end())
-                {
-                    delete it->second; // 释放旧节点
-                }
-                all_nodes[neighbor_key] = neighbor;
-                open_set.push(neighbor);
+                g_score[neighbor_key] = tentative_g;
+                int h = std::abs(goal_gx - nx) + std::abs(goal_gy - ny);
+                open_set.push({tentative_g + h, {nx, ny}});
+                parent_map[neighbor_key] = {cx, cy};
             }
         }
 
         iterations++;
     }
 
-    // ========== 3. 路径回溯 ==========
     int path_size = 0;
-    if (goal_node != nullptr)
+    if (goal_node.first != -1)
     {
-        // 从目标回溯到起点
         std::vector<std::pair<int, int>> grid_path;
-        AStarNode *node = goal_node;
-        while (node != nullptr)
+        std::pair<int, int> node = goal_node;
+        while (node.first != -1 && node.second != -1)
         {
-            grid_path.push_back({node->x, node->y});
-            node = node->parent;
+            grid_path.push_back(node);
+            int key = node.first * 1000 + node.second;
+            if (parent_map.count(key))
+            {
+                node = parent_map[key];
+            }
+            else
+            {
+                break;
+            }
         }
         std::reverse(grid_path.begin(), grid_path.end());
 
-        // 转换为世界坐标（相对起飞点）
         for (size_t i = 0; i < grid_path.size() && path_size < max_points; ++i)
         {
             float wx, wy;
@@ -500,37 +451,10 @@ int astar_plan(
         ROS_ERROR("[A*] 规划失败！无可行路径（迭代=%d）", iterations);
     }
 
-    // ========== 4. 释放内存 ==========
-    for (auto &kv : all_nodes)
-    {
-        delete kv.second;
-    }
-
     return path_size;
 }
 
-/************************************************************************
-核心函数：走廊生成器（B-spline插值 + 曲率动态宽度）
-========================================================================
-【算法原理】
-  1. B-spline插值：将A*离散路径转换为平滑曲线（消除网格锯齿）
-  2. 曲率计算：三点法估算路径曲率（1/半径）
-  3. 动态宽度：曲率>阈值时自动加宽20%（急弯防卡死）
-
-【输入输出】
-  @param astar_path_x/y  A*路径点（相对起飞点，米）
-  @param num_points      路径点数量
-  @param base_width      基础走廊宽度（米）
-  @param corridor_x/y    输出：走廊中心点（世界坐标系）
-  @param corridor_width  输出：对应点的走廊宽度（米）
-  @param max_size        输出数组最大容量
-  @return int            实际生成的走廊点数量
-
-【工程规范】
-  • 无全局变量：所有中间数据置于函数栈
-  • 边界处理：路径点<2时返回空走廊
-  • 曲率平滑：使用滑动窗口平均抑制噪声
-========================================================================*/
+// ========== 走廊生成器（全英文） ==========
 int generate_corridor(
     const float *astar_path_x,
     const float *astar_path_y,
@@ -541,7 +465,6 @@ int generate_corridor(
     float *corridor_width,
     int max_size)
 {
-    // ========== 1. 参数校验 ==========
     if (num_points < 2 || max_size < 2)
     {
         ROS_ERROR("[CORRIDOR] 路径点不足或输出数组过小");
@@ -553,14 +476,11 @@ int generate_corridor(
         base_width = std::max(0.5f, std::min(3.0f, base_width));
     }
 
-    // ========== 2. B-spline插值（3阶均匀B-spline） ==========
-    // 2.1 临时存储平滑路径（栈分配）
     const int MAX_SMOOTH_POINTS = 200;
     float smooth_x[MAX_SMOOTH_POINTS];
     float smooth_y[MAX_SMOOTH_POINTS];
     int smooth_count = 0;
 
-    // 2.2 均匀重采样（0.15m分辨率）
     float last_x = astar_path_x[0] + init_position_x_take_off;
     float last_y = astar_path_y[0] + init_position_y_take_off;
     smooth_x[smooth_count] = last_x;
@@ -572,12 +492,10 @@ int generate_corridor(
         float curr_x = astar_path_x[i] + init_position_x_take_off;
         float curr_y = astar_path_y[i] + init_position_y_take_off;
 
-        // 计算累积距离
         float dx = curr_x - last_x;
         float dy = curr_y - last_y;
         float dist = std::sqrt(dx * dx + dy * dy);
 
-        // 每0.15m插入一个点
         int segments = static_cast<int>(dist / 0.15f);
         if (segments < 1)
             segments = 1;
@@ -594,7 +512,6 @@ int generate_corridor(
         last_y = curr_y;
     }
 
-    // 2.3 添加终点
     if (smooth_count < MAX_SMOOTH_POINTS)
     {
         smooth_x[smooth_count] = astar_path_x[num_points - 1] + init_position_x_take_off;
@@ -604,34 +521,27 @@ int generate_corridor(
 
     ROS_DEBUG("[CORRIDOR] 路径平滑: %d点 → %d点", num_points, smooth_count);
 
-    // ========== 3. 生成走廊点（中心线+动态宽度） ==========
     int corridor_count = 0;
-    const float CURVATURE_THRESHOLD = 0.4f; // 曲率阈值（1/半径），>0.4视为急弯
+    const float CURVATURE_THRESHOLD = 0.4f;
 
     for (int i = 0; i < smooth_count && corridor_count < max_size; ++i)
     {
-        // 3.1 基础走廊宽度
         float width = base_width;
 
-        // 3.2 动态宽度调整：急弯处加宽20%
         if (i > 0 && i < smooth_count - 1)
         {
-            // 三点曲率计算（prev-current-next）
             float prev_x = smooth_x[i - 1], prev_y = smooth_y[i - 1];
             float curr_x = smooth_x[i], curr_y = smooth_y[i];
             float next_x = smooth_x[i + 1], next_y = smooth_y[i + 1];
 
-            // 向量
             float v1x = curr_x - prev_x, v1y = curr_y - prev_y;
             float v2x = next_x - curr_x, v2y = next_y - curr_y;
 
-            // 曲率 = |v1×v2| / (|v1|*|v2|)^1.5 （简化版）
             float cross = v1x * v2y - v1y * v2x;
             float v1_len = std::sqrt(v1x * v1x + v1y * v1y);
             float v2_len = std::sqrt(v2x * v2x + v2y * v2y);
             float curvature = std::abs(cross) / (std::pow(v1_len * v2_len, 1.5f) + 1e-6f);
 
-            // 滑动窗口平滑（抑制噪声）
             static float curvature_history[5] = {0};
             static int history_idx = 0;
             curvature_history[history_idx] = curvature;
@@ -644,13 +554,12 @@ int generate_corridor(
 
             if (avg_curvature > CURVATURE_THRESHOLD)
             {
-                width *= 1.2f; // 急弯加宽20%
+                width *= 1.2f;
                 ROS_DEBUG("[CORRIDOR] 急弯检测: idx=%d 曲率=%.2f → 宽度=%.2fm",
                           i, avg_curvature, width);
             }
         }
 
-        // 3.3 输出走廊点（世界坐标系）
         corridor_x[corridor_count] = smooth_x[i];
         corridor_y[corridor_count] = smooth_y[i];
         corridor_width[corridor_count] = width;
@@ -661,39 +570,7 @@ int generate_corridor(
     return corridor_count;
 }
 
-/************************************************************************
-核心函数：增强VFH+避障（含走廊软约束 + 历史记忆 + 振荡检测）
-========================================================================
-【三层防御体系】
-  L1: VFH+基础避障（直方图+三层代价函数）
-  L2: 走廊软约束融合（动态权重：障碍物近→VFH权重高）
-  L3: 振荡检测+切线恢复（位置标准差<0.25m + 角度变化>90°）
-
-【异常状态内嵌设计】
-  • 振荡检测：每帧更新历史，3秒窗口内判定
-  • 目标不可达：连续5帧目标方向被阻挡
-  • 视野变化：新检测到大型障碍物（半径>0.8m）
-  → 所有异常状态通过out_need_replan参数通知主控
-
-【输入输出】
-  @param target_x/y_rel  目标点（相对起飞点，米）
-  @param target_yaw      目标航向（弧度）
-  @param uav_radius      无人机半径（米）
-  @param safe_margin     安全裕度（米）
-  @param max_speed       最大速度（米/秒）
-  @param min_safe_dist   力场最小距离（米）
-  @param corridor_x/y    走廊中心点（世界坐标系）
-  @param corridor_width  走廊宽度数组（米）
-  @param corridor_size   走廊点数量
-  @param enable_corridor 是否启用走廊约束
-  @param out_need_replan 输出：是否需要A*重规划
-  @return bool           true=抵达目标点附近（<0.4m）
-
-【工程规范】
-  • 无文件级全局变量：所有中间数据置于函数栈
-  • 解耦设计：仅依赖obstacles/local_pos等必要传感器数据
-  • 参数驱动：全部行为由输入参数控制
-========================================================================*/
+// ========== VFH+避障（全英文，含走廊软约束） ==========
 bool vfh_plus_with_corridor(
     float target_x_rel,
     float target_y_rel,
@@ -709,10 +586,8 @@ bool vfh_plus_with_corridor(
     bool enable_corridor,
     bool &out_need_replan)
 {
-    // ========== 1. 初始化输出参数 ==========
     out_need_replan = false;
 
-    // ========== 2. 时空基准 ==========
     float drone_x = local_pos.pose.pose.position.x;
     float drone_y = local_pos.pose.pose.position.y;
     float drone_yaw = yaw;
@@ -724,7 +599,6 @@ bool vfh_plus_with_corridor(
     float dy_to_target = target_y_world - drone_y;
     float dist_to_target = std::sqrt(dx_to_target * dx_to_target + dy_to_target * dy_to_target);
 
-    // 目标过近处理
     if (dist_to_target < 0.3f)
     {
         setpoint_raw.position.x = drone_x;
@@ -735,14 +609,12 @@ bool vfh_plus_with_corridor(
         return true;
     }
 
-    // ========== 3. 栅格系统（63x63，0.08m分辨率） ==========
     static constexpr int GRID_SIZE = 63;
     static constexpr float GRID_RESOLUTION = 0.08f;
     static constexpr float DECAY_FACTOR = 0.94f;
     static constexpr float UPDATE_STRENGTH = 40.0f;
     static float certainty_grid[GRID_SIZE][GRID_SIZE] = {{0}};
 
-    // 3.1 栅格衰减
     for (int i = 0; i < GRID_SIZE; ++i)
     {
         for (int j = 0; j < GRID_SIZE; ++j)
@@ -753,7 +625,6 @@ bool vfh_plus_with_corridor(
         }
     }
 
-    // 3.2 障碍物投影
     float HALF_GRID = GRID_SIZE / 2.0f;
     float current_speed = current_vel.norm();
     float dynamic_safe_margin = safe_margin * (0.6f + 0.4f * current_speed / (max_speed + 0.1f));
@@ -797,8 +668,7 @@ bool vfh_plus_with_corridor(
         }
     }
 
-    // ========== 4. VFH+直方图构建 ==========
-    static constexpr int HISTOGRAM_BINS = 72; // 5°/扇区
+    static constexpr int HISTOGRAM_BINS = 72;
     float histogram[HISTOGRAM_BINS] = {0};
 
     for (int i = 0; i < GRID_SIZE; ++i)
@@ -835,9 +705,8 @@ bool vfh_plus_with_corridor(
         }
     }
 
-    // 直方图平滑
     float smoothed_histogram[HISTOGRAM_BINS] = {0};
-    int smooth_radius = 2; // 固定2扇区平滑
+    int smooth_radius = 2;
 
     for (int bin = 0; bin < HISTOGRAM_BINS; ++bin)
     {
@@ -857,14 +726,12 @@ bool vfh_plus_with_corridor(
         smoothed_histogram[bin] = sum / count;
     }
 
-    // ========== 5. 异常状态检测（内嵌设计） ==========
-    // 5.1 振荡检测（3秒窗口）
+    // ========== 异常状态检测（内嵌） ==========
     static std::vector<std::pair<float, float>> pos_history;
     static std::vector<float> yaw_history;
     static bool is_oscillating = false;
     static int oscillation_frames = 0;
 
-    // 更新历史（滑动窗口60帧@20Hz=3秒）
     pos_history.push_back({drone_x, drone_y});
     yaw_history.push_back(drone_yaw);
     if (pos_history.size() > 60)
@@ -873,10 +740,8 @@ bool vfh_plus_with_corridor(
         yaw_history.erase(yaw_history.begin());
     }
 
-    // 振荡判定
     if (!is_oscillating && pos_history.size() >= 30)
     {
-        // 位置标准差
         float mean_x = 0, mean_y = 0;
         for (const auto &pos : pos_history)
         {
@@ -895,7 +760,6 @@ bool vfh_plus_with_corridor(
         }
         pos_std = std::sqrt(pos_std / pos_history.size());
 
-        // 方向变化范围
         float min_yaw = *std::min_element(yaw_history.begin(), yaw_history.end());
         float max_yaw = *std::max_element(yaw_history.begin(), yaw_history.end());
         float yaw_range = std::abs(max_yaw - min_yaw) * 180.0f / M_PI;
@@ -903,14 +767,13 @@ bool vfh_plus_with_corridor(
         if (pos_std < 0.25f && yaw_range > 90.0f)
         {
             is_oscillating = true;
-            oscillation_frames = 40; // 2秒恢复（20Hz*2）
+            oscillation_frames = 40;
             ROS_WARN("[VFH+] 检测到振荡！位置标准差=%.2fm 角度变化=%.0f°",
                      pos_std, yaw_range);
-            out_need_replan = true; // 触发重规划
+            out_need_replan = true;
         }
     }
 
-    // 振荡恢复计时
     if (is_oscillating)
     {
         oscillation_frames--;
@@ -921,11 +784,9 @@ bool vfh_plus_with_corridor(
         }
     }
 
-    // 5.2 目标不可达检测（连续5帧目标方向被阻挡）
     static int target_blocked_count = 0;
     bool target_blocked = false;
 
-    // 射线检测：从无人机到目标的连线是否被障碍物阻挡
     float ray_steps = std::max(5.0f, dist_to_target / 0.2f);
     for (int s = 1; s <= static_cast<int>(ray_steps); ++s)
     {
@@ -962,14 +823,13 @@ bool vfh_plus_with_corridor(
         target_blocked_count = std::max(0, target_blocked_count - 1);
     }
 
-    // 5.3 视野变化检测（新大型障碍物）
     static std::vector<Obstacle> known_obstacles;
     bool new_large_obstacle = false;
 
     for (const auto &obs : obstacles)
     {
         if (obs.radius > 0.8f)
-        { // 大型障碍物阈值
+        {
             bool known = false;
             for (const auto &known_obs : known_obstacles)
             {
@@ -997,10 +857,9 @@ bool vfh_plus_with_corridor(
         out_need_replan = true;
     }
 
-    // ========== 6. 振荡恢复策略（切线移动） ==========
+    // ========== 振荡恢复策略 ==========
     if (is_oscillating && oscillation_frames > 0)
     {
-        // 沿最近障碍物切线方向移动
         float nearest_obs_dist = std::numeric_limits<float>::max();
         Eigen::Vector2f nearest_obs(0, 0);
         for (const auto &obs : obstacles)
@@ -1018,11 +877,9 @@ bool vfh_plus_with_corridor(
         float escape_angle = drone_yaw;
         if (nearest_obs_dist < std::numeric_limits<float>::max())
         {
-            // 计算切线方向
             float tangent_x = -(nearest_obs.y() - drone_y) / nearest_obs_dist;
             float tangent_y = (nearest_obs.x() - drone_x) / nearest_obs_dist;
 
-            // 选择与目标方向夹角较小的切线
             float dot = tangent_x * dx_to_target + tangent_y * dy_to_target;
             if (dot < 0)
             {
@@ -1036,7 +893,6 @@ bool vfh_plus_with_corridor(
             escape_angle = std::atan2(dy_to_target, dx_to_target);
         }
 
-        // 低速移动（40%最大速度）
         float recovery_speed = max_speed * 0.4f;
         float TIME_STEP = 0.1f;
         float safe_x = drone_x + std::cos(escape_angle) * recovery_speed * TIME_STEP;
@@ -1055,7 +911,7 @@ bool vfh_plus_with_corridor(
         return (dist_now < 0.4f);
     }
 
-    // ========== 7. VFH+基础避障（三层代价函数） ==========
+    // ========== VFH+基础避障 ==========
     struct ForceVector
     {
         float x, y;
@@ -1078,7 +934,7 @@ bool vfh_plus_with_corridor(
     };
 
     ForceVector repulsive_force;
-    float FRONT_HALF_ANGLE = M_PI_2; // ±90°前方扇形
+    float FRONT_HALF_ANGLE = M_PI_2;
 
     for (int i = 0; i < GRID_SIZE; ++i)
     {
@@ -1114,14 +970,13 @@ bool vfh_plus_with_corridor(
         }
     }
 
-    // ========== 8. 走廊软约束融合（动态权重） ==========
+    // ========== 走廊软约束融合 ==========
     ForceVector corridor_attraction;
     float dist_to_corridor_center = std::numeric_limits<float>::max();
     bool in_corridor = false;
 
     if (enable_corridor && corridor_size > 0)
     {
-        // 查找最近走廊点
         int nearest_idx = 0;
         float min_dist = std::numeric_limits<float>::max();
 
@@ -1137,16 +992,13 @@ bool vfh_plus_with_corridor(
             }
         }
 
-        // 计算到走廊中心的距离
         dist_to_corridor_center = min_dist;
         float half_width = corridor_width[nearest_idx] / 2.0f;
 
-        // 判定是否在走廊内
         if (dist_to_corridor_center < half_width)
         {
             in_corridor = true;
 
-            // 计算指向走廊中心的单位向量
             float to_center_x = corridor_x[nearest_idx] - drone_x;
             float to_center_y = corridor_y[nearest_idx] - drone_y;
             float to_center_mag = std::sqrt(to_center_x * to_center_x + to_center_y * to_center_y);
@@ -1156,7 +1008,6 @@ bool vfh_plus_with_corridor(
                 to_center_x /= to_center_mag;
                 to_center_y /= to_center_mag;
 
-                // 吸引力大小：距离中心越远，吸引力越强（软约束）
                 float weight = 0.3f + 0.7f * (1.0f - dist_to_corridor_center / half_width);
                 float attraction_mag = 0.8f * dist_to_corridor_center * weight;
 
@@ -1166,11 +1017,10 @@ bool vfh_plus_with_corridor(
         }
     }
 
-    // ========== 9. 历史方向记忆（增强运动惯性） ==========
+    // ========== 历史方向记忆 + 滞后效应 ==========
     static std::vector<int> bin_history;
     static int prev_selected_bin = -1;
 
-    // 计算目标扇区
     float target_angle = std::atan2(dy_to_target, dx_to_target);
     float target_relative_angle = target_angle - drone_yaw;
     while (target_relative_angle > M_PI)
@@ -1185,7 +1035,6 @@ bool vfh_plus_with_corridor(
     if (target_bin >= HISTOGRAM_BINS)
         target_bin = HISTOGRAM_BINS - 1;
 
-    // 更新历史（滑动窗口3帧）
     if (prev_selected_bin >= 0)
     {
         bin_history.push_back(prev_selected_bin);
@@ -1193,16 +1042,14 @@ bool vfh_plus_with_corridor(
             bin_history.erase(bin_history.begin());
     }
 
-    // ========== 10. 候选扇区筛选（含滞后效应） ==========
     std::vector<int> candidates;
     float prev_selected_cost = std::numeric_limits<float>::max();
 
     for (int bin = 0; bin < HISTOGRAM_BINS; ++bin)
     {
         if (smoothed_histogram[bin] > 60.0f)
-            continue; // 拥堵扇区过滤
+            continue;
 
-        // 三层代价函数
         int angle_diff = std::abs(bin - target_bin);
         if (angle_diff > HISTOGRAM_BINS / 2)
             angle_diff = HISTOGRAM_BINS - angle_diff;
@@ -1216,7 +1063,6 @@ bool vfh_plus_with_corridor(
         float obstacle_cost = smoothed_histogram[bin] / 60.0f;
         float base_cost = 0.5f * obstacle_cost + 0.4f * target_cost + 0.1f * turn_cost;
 
-        // 历史方向记忆折扣（连续同方向-20%）
         float history_discount = 0.0f;
         if (bin_history.size() >= 2)
         {
@@ -1225,7 +1071,7 @@ bool vfh_plus_with_corridor(
             {
                 int diff = std::abs(bin_history[i + 1] - bin_history[i]);
                 if (diff > HISTOGRAM_BINS / 4)
-                { // >45°视为不一致
+                {
                     consistent = false;
                     break;
                 }
@@ -1236,7 +1082,7 @@ bool vfh_plus_with_corridor(
                 if (hist_angle_diff > HISTOGRAM_BINS / 2)
                     hist_angle_diff = HISTOGRAM_BINS - hist_angle_diff;
                 if (hist_angle_diff < HISTOGRAM_BINS / 6)
-                { // <30°
+                {
                     history_discount = 0.2f;
                 }
             }
@@ -1244,7 +1090,6 @@ bool vfh_plus_with_corridor(
 
         float total_cost = base_cost * (1.0f - history_discount);
 
-        // 滞后效应：仅当新扇区显著更优时才切换（阈值15%）
         if (bin == prev_selected_bin)
         {
             candidates.push_back(bin);
@@ -1256,7 +1101,6 @@ bool vfh_plus_with_corridor(
         }
     }
 
-    // 无候选处理
     if (candidates.empty())
     {
         ROS_WARN("[VFH+] 无候选扇区，选择最低拥堵扇区");
@@ -1273,12 +1117,10 @@ bool vfh_plus_with_corridor(
         candidates.push_back(best_bin);
     }
 
-    // 选择最优扇区
     int best_bin = candidates[0];
     float min_cost = std::numeric_limits<float>::max();
     for (int bin : candidates)
     {
-        // 重新计算代价（含历史折扣）
         int angle_diff = std::abs(bin - target_bin);
         if (angle_diff > HISTOGRAM_BINS / 2)
             angle_diff = HISTOGRAM_BINS - angle_diff;
@@ -1328,8 +1170,7 @@ bool vfh_plus_with_corridor(
 
     prev_selected_bin = best_bin;
 
-    // ========== 11. 动态权重融合 ==========
-    // 最近障碍物距离（用于权重计算）
+    // ========== 动态权重融合 ==========
     float min_obstacle_dist = std::numeric_limits<float>::max();
     for (const auto &obs : obstacles)
     {
@@ -1342,18 +1183,15 @@ bool vfh_plus_with_corridor(
     if (min_obstacle_dist > 5.0f)
         min_obstacle_dist = 5.0f;
 
-    // 动态权重：障碍物越近，VFH+权重越高
     float vfh_weight = 1.0f - std::min(1.0f, min_obstacle_dist / 1.5f);
     vfh_weight = std::max(0.3f, vfh_weight);
     float corridor_weight = 1.0f - vfh_weight;
 
-    // 目标吸引力
     ForceVector attractive_force;
     attractive_force.add(
         (dx_to_target / dist_to_target) * 1.0f,
         (dy_to_target / dist_to_target) * 1.0f);
 
-    // 合成总力场
     ForceVector total_force;
     total_force.add(
         attractive_force.x - repulsive_force.x + corridor_attraction.x * corridor_weight,
@@ -1370,8 +1208,7 @@ bool vfh_plus_with_corridor(
         total_force.normalize();
     }
 
-    // ========== 12. 速度调制 + 指令生成 ==========
-    // 前方拥堵检测
+    // ========== 速度调制 + 指令生成 ==========
     float forward_congestion = 0.0f;
     int forward_start = (target_bin - 3 + HISTOGRAM_BINS) % HISTOGRAM_BINS;
     int forward_end = (target_bin + 3) % HISTOGRAM_BINS;
@@ -1383,18 +1220,15 @@ bool vfh_plus_with_corridor(
         }
     }
 
-    // 自适应速度
     float speed_factor = 1.0f - (forward_congestion / 60.0f) * 0.6f;
     if (speed_factor < 0.3f)
         speed_factor = 0.3f;
     float forward_speed = max_speed * speed_factor;
 
-    // 生成指令
     float TIME_STEP = 0.1f;
     float safe_x = drone_x + total_force.x * forward_speed * TIME_STEP;
     float safe_y = drone_y + total_force.y * forward_speed * TIME_STEP;
 
-    // 安全边界
     float step_dist = std::sqrt((safe_x - drone_x) * (safe_x - drone_x) + (safe_y - drone_y) * (safe_y - drone_y));
     if (step_dist > max_speed * TIME_STEP * 1.5f)
     {
@@ -1408,7 +1242,7 @@ bool vfh_plus_with_corridor(
     setpoint_raw.position.z = ALTITUDE;
     setpoint_raw.yaw = target_yaw;
 
-    // ========== 13. 到达判断 + 调试输出 ==========
+    // ========== 到达判断 + 调试输出 ==========
     float dist_now = std::sqrt((safe_x - target_x_world) * (safe_x - target_x_world) +
                                (safe_y - target_y_world) * (safe_y - target_y_world));
 
