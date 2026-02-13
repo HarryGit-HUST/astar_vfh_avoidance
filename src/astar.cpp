@@ -115,7 +115,7 @@ int main(int argc, char **argv)
 
   // ========== 起飞前准备（不纳入状态机） ==========
   // 等待连接到飞控
-  while (ros::ok() && !current_state.connected)
+  while (ros::ok() && !mavros_connection_state.connected)
   {
     ros::spinOnce();
     rate.sleep();
@@ -147,7 +147,7 @@ int main(int argc, char **argv)
 
   while (ros::ok())
   {
-    if (current_state.mode != "OFFBOARD" && (ros::Time::now() - last_request > ros::Duration(3.0)))
+    if (mavros_connection_state.mode != "OFFBOARD" && (ros::Time::now() - last_request > ros::Duration(3.0)))
     {
       if (if_debug == 1)
       {
@@ -164,7 +164,7 @@ int main(int argc, char **argv)
     }
     else
     {
-      if (!current_state.armed && (ros::Time::now() - last_request > ros::Duration(3.0)))
+      if (!mavros_connection_state.armed && (ros::Time::now() - last_request > ros::Duration(3.0)))
       {
         if (arming_client.call(arm_cmd) && arm_cmd.response.success)
         {
