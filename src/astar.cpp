@@ -52,6 +52,9 @@ float corridor_y[MAX_CORRIDOR_POINTS] = {0};
 float corridor_width[MAX_CORRIDOR_POINTS] = {0};
 int corridor_size = 0;
 
+// 重规划参数
+float REPLAN_COOLDOWN = 5.0f; // 重规划冷却时间（秒）
+
 void print_param()
 {
   std::cout << "=== 避障系统参数 ===" << std::endl;
@@ -232,11 +235,11 @@ int main(int argc, char **argv)
         // A*全局规划
         OccupancyGrid2D grid;
         grid.update_with_obstacles(obstacles, UAV_radius, safe_margin);
-
         float goal_x_world = init_position_x_take_off + target_x;
         float goal_y_world = init_position_y_take_off + target_y;
 
-        path_size = astar_plan(
+        // 【位置】第2122行 - 使用增量A*
+        path_size = incremental_astar_plan(
             grid,
             local_pos.pose.pose.position.x,
             local_pos.pose.pose.position.y,
@@ -256,7 +259,6 @@ int main(int argc, char **argv)
               corridor_x, corridor_y,
               corridor_width,
               MAX_CORRIDOR_POINTS);
-
           if (corridor_size > 0)
           {
             avoidance_state = AVOIDING;
@@ -294,7 +296,6 @@ int main(int argc, char **argv)
         }
         break;
       }
-
       case AVOIDING:
       {
         // VFH+避障（含走廊软约束）
