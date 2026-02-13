@@ -235,7 +235,7 @@ int astar_plan(
   return result_path_size;
 }
 // ============================================================================
-// 核心算法2：增量A*路径规划（完整实现）
+// 核心算法2：增量A*路径规划（修复版：单栅格系统兼容）
 // ============================================================================
 int incremental_astar_plan(
     const OccupancyGrid2D &grid,
@@ -244,24 +244,26 @@ int incremental_astar_plan(
     float *path_x, float *path_y,
     int max_points)
 {
-  // ========== 调试1: 打印规划参数 ==========
+  // ========== 调试1: 打印规划参数（关键诊断信息） ==========
   ROS_INFO("[DEBUG-A*] ===== 规划请求 =====");
-  ROS_INFO("[DEBUG-A*] 无人机位置: (%.2f, %.2f)", local_pos.pose.pose.position.x, local_pos.pose.pose.position.y);
-  ROS_INFO("[DEBUG-A*] 起飞点: (%.2f, %.2f)", init_position_x_take_off, init_position_y_take_off);
+  ROS_INFO("[DEBUG-A*] 无人机位置: (%.2f, %.2f, %.2f)",
+           local_pos.pose.pose.position.x, local_pos.pose.pose.position.y, local_pos.pose.pose.position.z);
+  ROS_INFO("[DEBUG-A*] 起飞点: (%.2f, %.2f, %.2f), yaw=%.2f",
+           init_position_x_take_off, init_position_y_take_off, init_position_z_take_off, init_yaw_take_off);
   ROS_INFO("[DEBUG-A*] 规划起点: (%.2f, %.2f) [相对起飞点: (%.2f, %.2f)]",
            start_x, start_y, start_x - init_position_x_take_off, start_y - init_position_y_take_off);
   ROS_INFO("[DEBUG-A*] 规划目标: (%.2f, %.2f) [相对起飞点: (%.2f, %.2f)]",
            goal_x, goal_y, goal_x - init_position_x_take_off, goal_y - init_position_y_take_off);
-  ROS_INFO("[DEBUG-A*] 地图范围: [%.1f,%.1f] x [%.1f,%.1f] (分辨率=%.2fm)",
-           grid.origin_x, grid.origin_x + 10.0f, grid.origin_y, grid.origin_y + 10.0f, grid.resolution_global);
+  ROS_INFO("[DEBUG-A*] 地图参数: origin=(%.1f,%.1f), resolution=%.2f, size=100x100",
+           grid.origin_x, grid.origin_y, grid.resolution);
 
   // ========== 1. 坐标转换：世界坐标 → 栅格坐标 ==========
   int start_gx, start_gy, goal_gx, goal_gy;
-  bool start_valid = grid.world_to_global_grid(start_x, start_y, start_gx, start_gy);
-  bool goal_valid = grid.world_to_global_grid(goal_x, goal_y, goal_gx, goal_gy);
+  bool start_valid = grid.world_to_grid(start_x, start_y, start_gx, start_gy);
+  bool goal_valid = grid.world_to_grid(goal_x, goal_y, goal_gx, goal_gy);
 
   // ========== 调试2: 检查坐标转换结果 ==========
-  ROS_INFO("[DEBUG-A*] 栅格坐标: start=(%d,%d) valid=%d, goal=(%d,%d) valid=%d",
+  ROS_INFO("[DEBUG-A*] 栅格坐标转换: start=(%d,%d) valid=%d, goal=(%d,%d) valid=%d",
            start_gx, start_gy, start_valid, goal_gx, goal_gy, goal_valid);
 
   if (!start_valid || !goal_valid)
@@ -271,10 +273,14 @@ int incremental_astar_plan(
     return 0;
   }
 
+  // ========== 调试3: 检查起点/目标点障碍物状态 ==========
+  ROS_INFO("[DEBUG-A*] 起点栅格值=%d (>%d=障碍物), 目标栅格值=%d",
+           grid.cells[start_gx][start_gy], 50, grid.cells[goal_gx][goal_gy]);
+
   // 边界检查：起点在障碍物内时自动偏移
   if (grid.cells[start_gx][start_gy] > 50)
   {
-    ROS_WARN("[增量A*] 起点在障碍物内，尝试5栅格内偏移");
+    ROS_WARN("[增量A*] 起点在障碍物内(值=%d)，尝试5栅格内偏移", grid.cells[start_gx][start_gy]);
     bool found = false;
     for (int r = 1; r <= 5 && !found; ++r)
     {
@@ -289,21 +295,41 @@ int incremental_astar_plan(
             start_gx = nx;
             start_gy = ny;
             found = true;
-            ROS_INFO("[增量A*] 起点偏移至栅格(%d,%d)", nx, ny);
+            ROS_INFO("[增量A*] 起点偏移至栅格(%d,%d), 值=%d", nx, ny, grid.cells[nx][ny]);
           }
         }
       }
     }
     if (!found)
     {
-      ROS_ERROR("[增量A*] 无法在5栅格内找到有效起点");
+      ROS_ERROR("[增量A*] 无法在5栅格内找到有效起点（周围全是障碍物）");
+      // ========== 调试4: 打印起点周围障碍物分布 ==========
+      ROS_INFO("[DEBUG-A*] 起点周围5栅格障碍物分布:");
+      for (int dy = -5; dy <= 5; ++dy)
+      {
+        std::string row = "";
+        for (int dx = -5; dx <= 5; ++dx)
+        {
+          int nx = start_gx + dx, ny = start_gy + dy;
+          if (nx >= 0 && nx < 100 && ny >= 0 && ny < 100)
+          {
+            row += (grid.cells[nx][ny] > 50) ? "X" : ".";
+          }
+          else
+          {
+            row += "#";
+          }
+        }
+        ROS_INFO("[DEBUG-A*] %s", row.c_str());
+      }
       return 0;
     }
   }
+
   // 边界检查：目标点在障碍物内时自动偏移
   if (grid.cells[goal_gx][goal_gy] > 50)
   {
-    ROS_WARN("[增量A*] 目标点在障碍物内，尝试5栅格内偏移");
+    ROS_WARN("[增量A*] 目标点在障碍物内(值=%d)，尝试5栅格内偏移", grid.cells[goal_gx][goal_gy]);
     bool found = false;
     for (int r = 1; r <= 5 && !found; ++r)
     {
@@ -318,7 +344,7 @@ int incremental_astar_plan(
             goal_gx = nx;
             goal_gy = ny;
             found = true;
-            ROS_INFO("[增量A*] 目标点偏移至栅格(%d,%d)", nx, ny);
+            ROS_INFO("[增量A*] 目标点偏移至栅格(%d,%d), 值=%d", nx, ny, grid.cells[nx][ny]);
           }
         }
       }
@@ -329,6 +355,7 @@ int incremental_astar_plan(
       return 0;
     }
   }
+
   // ========== 2. 增量A*主循环 ==========
   // 优先队列：f(n) = g(n) + h(n)，按f值升序排列
   auto cmp = [](const std::pair<int, std::pair<int, int>> &a,
@@ -340,20 +367,26 @@ int incremental_astar_plan(
                       std::vector<std::pair<int, std::pair<int, int>>>,
                       decltype(cmp)>
       open_set(cmp);
+
   // g_score缓存：栅格ID(gx*1000+gy) → g值
   std::unordered_map<int, int> g_score;
+
   // 父节点映射：用于路径回溯
   std::unordered_map<int, std::pair<int, int>> parent_map;
+
   // 闭集：已扩展节点
   std::unordered_set<int> closed_set;
+
   // ========== 3. 增量A*关键逻辑 ==========
   // 3.1 重用上次规划路径（如果存在）
   static std::vector<std::pair<int, int>> last_path;
   static int last_start_gx = -1, last_start_gy = -1;
   static int last_goal_gx = -1, last_goal_gy = -1;
+
   // 仅当起点/目标变化或障碍物变化时才重新规划
   bool need_replan = (start_gx != last_start_gx || start_gy != last_start_gy ||
                       goal_gx != last_goal_gx || goal_gy != last_goal_gy);
+
   // 3.2 计算受影响区域（障碍物变化区域+路径影响区域）
   std::unordered_set<int> affected_area;
   if (need_replan)
@@ -440,10 +473,12 @@ int incremental_astar_plan(
     ROS_INFO("[增量A*] 重用上次规划路径，无需重新计算");
     return result_path_size;
   }
+
   // 3.4 增量A*搜索
   std::pair<int, int> goal_node = {-1, -1};
   int iterations = 0;
   const int MAX_ITERATIONS = 5000; // 增量A*迭代次数减少50%
+
   while (!open_set.empty() && iterations < MAX_ITERATIONS)
   {
     auto current = open_set.top();
@@ -451,34 +486,43 @@ int incremental_astar_plan(
     int cx = current.second.first;
     int cy = current.second.second;
     int current_key = cx * 1000 + cy;
+
     // 到达目标
     if (cx == goal_gx && cy == goal_gy)
     {
       goal_node = {cx, cy};
       break;
     }
+
     // 已在闭集，跳过
     if (closed_set.count(current_key))
       continue;
     closed_set.insert(current_key);
+
     // 4方向扩展（上下左右）
     const int dx[4] = {1, -1, 0, 0};
     const int dy[4] = {0, 0, 1, -1};
+
     for (int i = 0; i < 4; ++i)
     {
       int nx = cx + dx[i];
       int ny = cy + dy[i];
+
       // 边界/障碍物检查
       if (nx < 0 || nx >= 100 || ny < 0 || ny >= 100 || grid.cells[nx][ny] > 50)
         continue;
+
       // 仅搜索受影响区域
       if (affected_area.find(nx * 1000 + ny) == affected_area.end())
         continue;
+
       int neighbor_key = nx * 1000 + ny;
       if (closed_set.count(neighbor_key))
         continue;
+
       // 计算新g值
       int tentative_g = g_score[current_key] + 1;
+
       // 更新或插入
       if (!g_score.count(neighbor_key) || tentative_g < g_score[neighbor_key])
       {
@@ -488,8 +532,10 @@ int incremental_astar_plan(
         parent_map[neighbor_key] = {cx, cy};
       }
     }
+
     iterations++;
   }
+
   // ========== 4. 路径回溯 ==========
   int result_path_size = 0;
   if (goal_node.first != -1)
@@ -511,12 +557,14 @@ int incremental_astar_plan(
       }
     }
     std::reverse(grid_path.begin(), grid_path.end());
+
     // 保存本次路径用于下次增量规划
     last_path = grid_path;
     last_start_gx = start_gx;
     last_start_gy = start_gy;
     last_goal_gx = goal_gx;
     last_goal_gy = goal_gy;
+
     // 转换为世界坐标（相对起飞点）
     for (size_t i = 0; i < grid_path.size() && result_path_size < max_points; ++i)
     {
@@ -526,12 +574,25 @@ int incremental_astar_plan(
       path_y[result_path_size] = wy - init_position_y_take_off;
       result_path_size++;
     }
+
     ROS_INFO("[增量A*] 规划成功，生成 %d 个路径点（迭代=%d）", result_path_size, iterations);
   }
   else
   {
     ROS_ERROR("[增量A*] 规划失败！无可行路径（迭代=%d）", iterations);
+    // ========== 调试5: 检查地图连通性 ==========
+    ROS_INFO("[DEBUG-A*] 地图连通性检查:");
+    int free_cells = 0, obstacle_cells = 0;
+    for (int i = 0; i < 100; ++i)
+      for (int j = 0; j < 100; ++j)
+        if (grid.cells[i][j] > 50)
+          obstacle_cells++;
+        else
+          free_cells++;
+    ROS_INFO("[DEBUG-A*] 空闲栅格: %d, 障碍物栅格: %d, 障碍物占比: %.1f%%",
+             free_cells, obstacle_cells, obstacle_cells * 100.0f / (free_cells + obstacle_cells));
   }
+
   return result_path_size;
 }
 // ============================================================================
@@ -1487,7 +1548,7 @@ int main(int argc, char **argv)
           ROS_INFO("[DEBUG-PLANNING] 最近障碍物: 半径=%.2f, 位置=(%.2f,%.2f)",
                    obstacles[0].radius, obstacles[0].position.x(), obstacles[0].position.y());
         }
-        
+
         float goal_x_world = init_position_x_take_off + target_x;
         float goal_y_world = init_position_y_take_off + target_y;
         // 使用增量A*规划
