@@ -244,14 +244,33 @@ int incremental_astar_plan(
     float *path_x, float *path_y,
     int max_points)
 {
+  // ========== 调试1: 打印规划参数 ==========
+  ROS_INFO("[DEBUG-A*] ===== 规划请求 =====");
+  ROS_INFO("[DEBUG-A*] 无人机位置: (%.2f, %.2f)", local_pos.pose.pose.position.x, local_pos.pose.pose.position.y);
+  ROS_INFO("[DEBUG-A*] 起飞点: (%.2f, %.2f)", init_position_x_take_off, init_position_y_take_off);
+  ROS_INFO("[DEBUG-A*] 规划起点: (%.2f, %.2f) [相对起飞点: (%.2f, %.2f)]",
+           start_x, start_y, start_x - init_position_x_take_off, start_y - init_position_y_take_off);
+  ROS_INFO("[DEBUG-A*] 规划目标: (%.2f, %.2f) [相对起飞点: (%.2f, %.2f)]",
+           goal_x, goal_y, goal_x - init_position_x_take_off, goal_y - init_position_y_take_off);
+  ROS_INFO("[DEBUG-A*] 地图范围: [%.1f,%.1f] x [%.1f,%.1f] (分辨率=%.2fm)",
+           grid.origin_x, grid.origin_x + 10.0f, grid.origin_y, grid.origin_y + 10.0f, grid.resolution_global);
+
   // ========== 1. 坐标转换：世界坐标 → 栅格坐标 ==========
   int start_gx, start_gy, goal_gx, goal_gy;
-  if (!grid.world_to_grid(start_x, start_y, start_gx, start_gy) ||
-      !grid.world_to_grid(goal_x, goal_y, goal_gx, goal_gy))
+  bool start_valid = grid.world_to_global_grid(start_x, start_y, start_gx, start_gy);
+  bool goal_valid = grid.world_to_global_grid(goal_x, goal_y, goal_gx, goal_gy);
+
+  // ========== 调试2: 检查坐标转换结果 ==========
+  ROS_INFO("[DEBUG-A*] 栅格坐标: start=(%d,%d) valid=%d, goal=(%d,%d) valid=%d",
+           start_gx, start_gy, start_valid, goal_gx, goal_gy, goal_valid);
+
+  if (!start_valid || !goal_valid)
   {
     ROS_ERROR("[增量A*] 起点/目标点超出地图范围（[-5,5]米）");
+    ROS_ERROR("[DEBUG-A*] 请检查: 1)起飞点是否初始化 2)目标点是否在[-5,5]米内");
     return 0;
   }
+
   // 边界检查：起点在障碍物内时自动偏移
   if (grid.cells[start_gx][start_gy] > 50)
   {
@@ -1459,6 +1478,16 @@ int main(int argc, char **argv)
         // A*全局规划
         OccupancyGrid2D grid;
         grid.update_with_obstacles(obstacles, UAV_radius, safe_margin);
+        // ========== 调试: 障碍物统计 ==========
+        int obs_count = obstacles.size();
+        ROS_INFO("[DEBUG-PLANNING] 检测到 %d 个障碍物, 无人机位置=(%.2f,%.2f)",
+                 obs_count, local_pos.pose.pose.position.x, local_pos.pose.pose.position.y);
+        if (obs_count > 0)
+        {
+          ROS_INFO("[DEBUG-PLANNING] 最近障碍物: 半径=%.2f, 位置=(%.2f,%.2f)",
+                   obstacles[0].radius, obstacles[0].position.x(), obstacles[0].position.y());
+        }
+        
         float goal_x_world = init_position_x_take_off + target_x;
         float goal_y_world = init_position_y_take_off + target_y;
         // 使用增量A*规划

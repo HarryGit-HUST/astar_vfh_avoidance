@@ -135,6 +135,15 @@ void local_pos_cb(const nav_msgs::Odometry::ConstPtr &msg)
         init_yaw_take_off = yaw;
         flag_init_position = true;
     }
+    // ========== 调试: 起飞点初始化状态 ==========
+    static int init_debug_count = 0;
+    if (init_debug_count < 5 || flag_init_position)
+    { // 只打印前5次和初始化成功时
+        ROS_INFO("[DEBUG-ODOM] init_flag=%d, height=%.2f, takeoff=(%.2f,%.2f,%.2f)",
+                 flag_init_position, local_pos.pose.pose.position.z,
+                 init_position_x_take_off, init_position_y_take_off, init_position_z_take_off);
+        init_debug_count++;
+    }
 }
 // ============================================================================
 // 函数3：位置巡航控制
