@@ -16,8 +16,8 @@ time_final: 70.0          # 任务超时时间（秒）
 UAV_radius: 0.3           # 无人机等效半径（米）
 
 # --- 避障参数 ---
-safe_margin: 0.4          # VFH+ 安全裕度（米）
-MAX_SPEED: 0.9            # 最大前进速度（米/秒）
+safe_margin: 0.1          # VFH+ 安全裕度（米）
+MAX_SPEED: 1.9            # 最大前进速度（米/秒）
 MIN_SAFE_DISTANCE: 0.25   # 力场计算最小距离（米）
 
 # --- 走廊参数 ---

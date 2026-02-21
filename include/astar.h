@@ -86,7 +86,7 @@ float OSCILLATION_RECOVERY_DURATION = 2.0f;
 float ASTAR_SAFETY_MARGIN = 0.0f;
 
 /** 重规划冷却时间（秒）- 两次重规划之间的最小时间间隔 */
-float REPLAN_COOLDOWN = 5.0f;
+//float REPLAN_COOLDOWN = 5.0f;
 
 /** 走廊基础宽度（米）- 走廊的基础宽度 */
 float CORRIDOR_BASE_WIDTH = 0.8f;
