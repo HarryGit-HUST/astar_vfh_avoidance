@@ -2,26 +2,24 @@
 astar.h - 无人机智能避障系统核心头文件
 ============================================================================
 系统架构：三层防御体系
-L1: A*全局规划（战略层） - 生成初始路径（动态地图+目标点投影）
-L2: 走廊生成器（战术层） - 将离散路径转换为平滑走廊（B-spline + 曲率自适应）
-L3: VFH+避障（执行层） - 局部避障 + 走廊软约束融合 + 异常检测
-异常处理内嵌设计：
-• 振荡检测：位置标准差<0.25m + 角度变化>90° → 触发重规划
-• 路径阻塞检测：规划路径被新障碍物占据 → 触发重规划
-• 视野变化：检测到新大型障碍物(半径>0.8m) → 触发重规划
-工程规范：
-• 动态地图：以无人机当前位置为中心，覆盖[-5.0,5.0]米范围
-• 目标点投影：超出地图时投影到边界（连线交点）
-• 障碍物膨胀：仅使用障碍物半径+无人机半径（无额外安全裕度）
-• 路径简化：道格拉斯-普克算法（阈值0.3m）
-版本：2.2 (2026-02-14)
+L1: A*全局规划（战略层） - 生成初始路径
+L2: 走廊生成器（战术层） - 将离散路径转换为平滑走廊
+L3: VFH+ 避障（执行层） - 局部避障 + 走廊软约束融合 + 异常检测
+
+<第 1 次修改> 动态地图改为全局地图，分辨率调整为 0.15m
+<第 2 次修改> 优化振荡检测阈值，避免低速误判
+<第 3 次修改> 增加调试 ROS_INFO，提高可溯源性
+<第 4 次修改> 参数外置到 yaml，增加物理含义注释
+
+版本：3.0 (2026-02-14)
 作者：智能避障系统
 ******************************************************************************/
 #ifndef ASTAR_H
 #define ASTAR_H
+
 #include <string>
 #include <vector>
-#include "new_detect_obs.h" // PCL障碍物检测接口
+#include "new_detect_obs.h"
 #include <ros/ros.h>
 #include <geometry_msgs/PoseStamped.h>
 #include <geometry_msgs/Point.h>
@@ -45,38 +43,103 @@ L3: VFH+避障（执行层） - 局部避障 + 走廊软约束融合 + 异常检
 #include <queue>
 #include <unordered_map>
 #include <unordered_set>
+
 using namespace std;
+
 // ============================================================================
 // 全局常量定义
 // ============================================================================
 /** 飞行高度（米）- 所有任务的统一巡航高度 */
 #define ALTITUDE 0.7f
-/** Mavros位置控制指令（全局变量，由各函数写入，main循环发布） */
+
+/** Mavros 位置控制指令（全局变量，由各函数写入，main 循环发布） */
 mavros_msgs::PositionTarget setpoint_raw;
+
 /** 无人机历史位置（二维世界坐标系，单位：米） */
 Eigen::Vector2f current_pos;
+
 /** 无人机历史速度（二维世界坐标系，单位：米/秒） */
 Eigen::Vector2f current_vel;
+
 // ============================================================================
-// 函数1：MAVROS连接状态回调
+// 可配置参数（从 yaml 读取，具有物理含义）
 // ============================================================================
+/** 全局地图尺寸（米）- 地图覆盖范围 */
+float GLOBAL_MAP_SIZE = 20.0f;
+
+/** 全局地图分辨率（米/栅格）- 分辨率越低，地图越精细但计算量越大 */
+float GLOBAL_MAP_RESOLUTION = 0.15f;
+
+/** 振荡检测位置阈值（米）- 低于此值且角度变化大时判定为振荡 */
+float OSCILLATION_POS_THRESHOLD = 0.15f;
+
+/** 振荡检测角度阈值（度）- 高于此值且位置稳定时判定为振荡 */
+float OSCILLATION_ANGLE_THRESHOLD = 120.0f;
+
+/** 振荡检测时间窗口（秒）- 历史数据时间窗口 */
+float OSCILLATION_TIME_WINDOW = 3.0f;
+
+/** 振荡恢复持续时间（秒）- 振荡恢复策略持续时间 */
+float OSCILLATION_RECOVERY_DURATION = 2.0f;
+
+/** A*安全裕度（米）- A*规划时的安全裕度，0 表示无额外裕度 */
+float ASTAR_SAFETY_MARGIN = 0.0f;
+
+/** 重规划冷却时间（秒）- 两次重规划之间的最小时间间隔 */
+float REPLAN_COOLDOWN = 5.0f;
+
+/** 走廊基础宽度（米）- 走廊的基础宽度 */
+float CORRIDOR_BASE_WIDTH = 0.8f;
+
+/** 走廊急弯加宽系数 - 急弯时走廊宽度放大倍数 */
+float CORRIDOR_CURVATURE_SCALE = 1.2f;
+
+/** 走廊曲率阈值（1/米）- 超过此曲率视为急弯 */
+float CORRIDOR_CURVATURE_THRESHOLD = 0.4f;
+
+// ============================================================================
+// 函数 1：MAVROS 连接状态回调
+// ============================================================================
+/** MAVROS 飞控连接状态（独立变量，避免与任务状态机冲突） */
 mavros_msgs::State mavros_connection_state;
+
+/**
+ * @brief MAVROS 状态回调函数
+ * @param msg MAVROS 状态消息指针
+ */
 void state_cb(const mavros_msgs::State::ConstPtr &msg);
 void state_cb(const mavros_msgs::State::ConstPtr &msg)
 {
     mavros_connection_state = *msg;
 }
+
 // ============================================================================
-// 函数2：里程计信息回调
+// 函数 2：里程计信息回调
 // ============================================================================
+/** 四元数（临时变量，用于姿态转换） */
 tf::Quaternion quat;
+
+/** 里程计原始数据（全局变量，供其他函数读取） */
 nav_msgs::Odometry local_pos;
+
+/** 欧拉角（roll/pitch/yaw，单位：弧度） */
 double roll, pitch, yaw;
+
+/** 起飞点世界坐标（X/Y/Z，单位：米） */
 float init_position_x_take_off = 0;
 float init_position_y_take_off = 0;
 float init_position_z_take_off = 0;
+
+/** 起飞点航向角（单位：弧度） */
 float init_yaw_take_off = 0;
+
+/** 起飞点初始化标志 */
 bool flag_init_position = false;
+
+/**
+ * @brief 里程计回调函数
+ * @param msg 里程计消息指针
+ */
 void local_pos_cb(const nav_msgs::Odometry::ConstPtr &msg);
 void local_pos_cb(const nav_msgs::Odometry::ConstPtr &msg)
 {
@@ -84,10 +147,14 @@ void local_pos_cb(const nav_msgs::Odometry::ConstPtr &msg)
     tf::quaternionMsgToTF(local_pos.pose.pose.orientation, quat);
     tf::Matrix3x3(quat).getRPY(roll, pitch, yaw);
     current_pos = Eigen::Vector2f(local_pos.pose.pose.position.x, local_pos.pose.pose.position.y);
+
+    // 机体速度→世界速度转换
     tf::Vector3 body_vel(local_pos.twist.twist.linear.x, local_pos.twist.twist.linear.y, local_pos.twist.twist.linear.z);
     tf::Matrix3x3 rot_matrix(quat);
     tf::Vector3 world_vel = rot_matrix * body_vel;
     current_vel = Eigen::Vector2f(world_vel.x(), world_vel.y());
+
+    // 首次高度>0.1m 时记录起飞点
     if (flag_init_position == false && (local_pos.pose.pose.position.z > 0.1))
     {
         init_position_x_take_off = local_pos.pose.pose.position.x;
@@ -95,17 +162,34 @@ void local_pos_cb(const nav_msgs::Odometry::ConstPtr &msg)
         init_position_z_take_off = local_pos.pose.pose.position.z;
         init_yaw_take_off = yaw;
         flag_init_position = true;
+        ROS_INFO("[ODOM] 起飞点已初始化：(%.2f, %.2f, %.2f)",
+                 init_position_x_take_off, init_position_y_take_off, init_position_z_take_off);
     }
 }
+
 // ============================================================================
-// 函数3：位置巡航控制
+// 函数 3：位置巡航控制
 // ============================================================================
+/** 上次巡航目标位置 */
 float mission_pos_cruise_last_position_x = 0;
 float mission_pos_cruise_last_position_y = 0;
+
+/** 巡航超时阈值（秒） */
 float mission_cruise_timeout = 180.0f;
+
+/** 任务开始时间 */
 ros::Time mission_cruise_start_time;
+
+/** 超时标志 */
 bool mission_cruise_timeout_flag = false;
+
+/** 任务标志 */
 bool mission_pos_cruise_flag = false;
+
+/**
+ * @brief 位置巡航控制函数
+ * @return bool true=到达目标点，false=未到达
+ */
 bool mission_pos_cruise(float x, float y, float z, float target_yaw, float error_max);
 bool mission_pos_cruise(float x, float y, float z, float target_yaw, float error_max)
 {
@@ -117,20 +201,23 @@ bool mission_pos_cruise(float x, float y, float z, float target_yaw, float error
         mission_cruise_start_time = ros::Time::now();
         mission_cruise_timeout_flag = false;
     }
+
     ros::Duration elapsed_time = ros::Time::now() - mission_cruise_start_time;
     if (elapsed_time.toSec() > mission_cruise_timeout && !mission_cruise_timeout_flag)
     {
-        ROS_WARN("[巡航超时] 已耗时%.1f秒（阈值%.1f秒），强制切换下一个任务！", elapsed_time.toSec(), mission_cruise_timeout);
+        ROS_WARN("[巡航超时] 已耗时%.1f 秒，强制切换下一个任务！", elapsed_time.toSec());
         mission_cruise_timeout_flag = true;
         mission_pos_cruise_flag = false;
         return true;
     }
-    setpoint_raw.type_mask = /*1 + 2 + 4 */ +8 + 16 + 32 + 64 + 128 + 256 + 512 /*+ 1024 */ + 2048;
+
+    setpoint_raw.type_mask = 8 + 16 + 32 + 64 + 128 + 256 + 512 + 2048;
     setpoint_raw.coordinate_frame = 1;
     setpoint_raw.position.x = x + init_position_x_take_off;
     setpoint_raw.position.y = y + init_position_y_take_off;
     setpoint_raw.position.z = z + init_position_z_take_off;
     setpoint_raw.yaw = target_yaw;
+
     if (fabs(local_pos.pose.pose.position.x - x - init_position_x_take_off) < error_max &&
         fabs(local_pos.pose.pose.position.y - y - init_position_y_take_off) < error_max &&
         fabs(local_pos.pose.pose.position.z - z - init_position_z_take_off) < error_max &&
@@ -143,15 +230,30 @@ bool mission_pos_cruise(float x, float y, float z, float target_yaw, float error
     }
     return false;
 }
+
 // ============================================================================
-// 函数4：精确降落控制
+// 函数 4：精确降落控制
 // ============================================================================
+/** 降落起始位置 */
 float precision_land_init_position_x = 0;
 float precision_land_init_position_y = 0;
+
+/** 降落起始标志 */
 bool precision_land_init_position_flag = false;
+
+/** 悬停完成标志 */
 bool hovor_done = false;
+
+/** 降落完成标志 */
 bool land_done = false;
+
+/** 阶段切换时间戳 */
 ros::Time precision_land_last_time;
+
+/**
+ * @brief 精确降落控制函数
+ * @return bool true=降落完成，false=降落中
+ */
 bool precision_land(float err_max);
 bool precision_land(float err_max)
 {
@@ -162,6 +264,7 @@ bool precision_land(float err_max)
         precision_land_last_time = ros::Time::now();
         precision_land_init_position_flag = true;
     }
+
     if (fabs(local_pos.pose.pose.position.x - precision_land_init_position_x) < err_max / 2 &&
             fabs(local_pos.twist.twist.linear.x) < err_max / 10 &&
             fabs(local_pos.pose.pose.position.y - precision_land_init_position_y) < err_max / 2 &&
@@ -171,11 +274,13 @@ bool precision_land(float err_max)
         hovor_done = true;
         precision_land_last_time = ros::Time::now();
     }
+
     if (!land_done && hovor_done && (fabs(local_pos.pose.pose.position.z - init_position_z_take_off) < err_max / 5 || ros::Time::now() - precision_land_last_time > ros::Duration(5.0)))
     {
         land_done = true;
         precision_land_last_time = ros::Time::now();
     }
+
     if (land_done && ros::Time::now() - precision_land_last_time > ros::Duration(2.0))
     {
         ROS_INFO("Precision landing complete.");
@@ -184,8 +289,10 @@ bool precision_land(float err_max)
         land_done = false;
         return true;
     }
+
     setpoint_raw.position.x = precision_land_init_position_x;
     setpoint_raw.position.y = precision_land_init_position_y;
+
     if (!land_done && !hovor_done)
     {
         setpoint_raw.position.z = ALTITUDE;
@@ -201,107 +308,81 @@ bool precision_land(float err_max)
         setpoint_raw.position.z = local_pos.pose.pose.position.z - 0.02;
         ROS_INFO("稳定中");
     }
-    setpoint_raw.type_mask = /*1 + 2 + 4 +*/ 8 + 16 + 32 + 64 + 128 + 256 + 512 /*+ 1024 + 2048*/;
+
+    setpoint_raw.type_mask = 8 + 16 + 32 + 64 + 128 + 256 + 512;
     setpoint_raw.coordinate_frame = 1;
     return false;
 }
+
 // ============================================================================
-// 辅助结构：2D栅格地图（A*规划使用）
+// 辅助结构：2D 栅格地图（A*规划使用）
 // ============================================================================
 /**
-@brief 2D栅格地图结构体（用于A*规划）
-@details
-【动态地图设计】
-- 地图始终以无人机当前位置为中心
-- 覆盖范围：[-5.0, 5.0]米 × [-5.0, 5.0]米（相对无人机当前位置）
-- 栅格尺寸：100×100，分辨率0.1米/栅格
-【坐标转换】
-  世界坐标(x,y) → 栅格坐标(gx,gy):
-    gx = (x - drone_x) / resolution + 50  // 50为中心栅格
-    gy = (y - drone_y) / resolution + 50
-【障碍物处理】
-  膨胀半径 = 障碍物半径 + 无人机半径（无额外安全裕度）
-@note 动态地图确保A*始终规划前方5米内路径，避免边界问题
-*/
+ * @brief 2D 栅格地图结构体（用于 A*规划）
+ *
+ * <第 1 次修改> 动态地图改为全局地图，分辨率调整为 0.15m
+ */
 struct OccupancyGrid2D
 {
-    uint8_t cells[100][100]; // 栅格值 [0,100]
-    float resolution;        // 栅格分辨率（米）
-    float drone_x;           // 无人机当前位置X（世界坐标系，用于动态地图中心）
-    float drone_y;           // 无人机当前位置Y（世界坐标系）
+    uint8_t cells[200][200]; // <第 1 次修改> 地图尺寸从 100x100 改为 200x200
+    float resolution;
+    float origin_x;
+    float origin_y;
+    int map_size; // <第 1 次修改> 地图尺寸
 
+    /**
+     * @brief 构造函数：初始化地图参数
+     *
+     * <第 1 次修改> 使用全局地图参数初始化
+     */
     OccupancyGrid2D()
     {
-        resolution = 0.1f;
-        drone_x = 0.0f;
-        drone_y = 0.0f;
-        for (int i = 0; i < 100; ++i)
-            for (int j = 0; j < 100; ++j)
+        resolution = GLOBAL_MAP_RESOLUTION;             // <第 1 次修改> 使用可配置分辨率
+        map_size = (int)(GLOBAL_MAP_SIZE / resolution); // <第 1 次修改> 根据分辨率计算地图尺寸
+        origin_x = -GLOBAL_MAP_SIZE / 2.0f;             // <第 1 次修改> 原点在地图中心
+        origin_y = -GLOBAL_MAP_SIZE / 2.0f;
+
+        for (int i = 0; i < map_size; ++i)
+            for (int j = 0; j < map_size; ++j)
                 cells[i][j] = 0;
+
+        ROS_INFO("[MAP] 全局地图初始化：尺寸=%dx%d, 分辨率=%.2fm, 覆盖范围=%.1fx%.1fm",
+                 map_size, map_size, resolution, GLOBAL_MAP_SIZE, GLOBAL_MAP_SIZE);
     }
 
     /**
-    @brief 世界坐标 → 栅格坐标转换（动态地图）
-    @param wx 世界X坐标（米）
-    @param wy 世界Y坐标（米）
-    @param gx[out] 栅格X坐标
-    @param gy[out] 栅格Y坐标
-    @return bool true=转换成功（在地图范围内），false=超出范围
-    @note 以无人机当前位置为中心，覆盖[-5.0,5.0]米范围
-    */
+     * @brief 世界坐标 → 栅格坐标转换
+     */
     bool world_to_grid(float wx, float wy, int &gx, int &gy) const
     {
-        // <第1次修改> 位置：OccupancyGrid2D::world_to_grid函数
-        // 思路：动态地图坐标转换（以无人机当前位置为中心）
-        gx = static_cast<int>((wx - drone_x) / resolution + 50.0f); // 50为中心栅格(0,0)
-        gy = static_cast<int>((wy - drone_y) / resolution + 50.0f);
-        return (gx >= 0 && gx < 100 && gy >= 0 && gy < 100);
+        gx = static_cast<int>((wx - origin_x) / resolution);
+        gy = static_cast<int>((wy - origin_y) / resolution);
+        return (gx >= 0 && gx < map_size && gy >= 0 && gy < map_size);
     }
 
     /**
-    @brief 栅格坐标 → 世界坐标转换（动态地图）
-    @param gx 栅格X坐标
-    @param gy 栅格Y坐标
-    @param wx[out] 世界X坐标（米）
-    @param wy[out] 世界Y坐标（米）
-    */
+     * @brief 栅格坐标 → 世界坐标转换
+     */
     void grid_to_world(int gx, int gy, float &wx, float &wy) const
     {
-        // <第1次修改> 位置：OccupancyGrid2D::grid_to_world函数
-        // 思路：动态地图坐标反转换
-        wx = drone_x + (gx - 50.0f) * resolution;
-        wy = drone_y + (gy - 50.0f) * resolution;
+        wx = origin_x + gx * resolution;
+        wy = origin_y + gy * resolution;
     }
 
     /**
-    @brief 更新障碍物地图（含衰减机制 + 动态地图中心）
-    @param obstacles 障碍物列表（来自PCL检测）
-    @param drone_radius 无人机半径（米）- 用于障碍物膨胀
-    @param safety_margin 安全裕度（米）- 保留接口但不用于膨胀
-    @param current_drone_x 无人机当前位置X（世界坐标系）
-    @param current_drone_y 无人机当前位置Y（世界坐标系）
-    @details
-    1. 衰减旧障碍物：cells[i][j] -= 2（模拟动态环境）
-    2. 障碍物膨胀：圆形膨胀，半径=障碍物半径+无人机半径（无额外安全裕度）
-    3. 动态地图中心：以无人机当前位置为中心更新地图
-    @note A*规划使用最小安全膨胀，VFH+负责精细避障
-    */
+     * @brief 更新障碍物地图
+     *
+     * <第 4 次修改> 移除安全裕度，仅标记障碍物本身
+     */
     void update_with_obstacles(
         const std::vector<Obstacle> &obstacles,
-        float drone_radius,  // 用于障碍物膨胀
-        float safety_margin, // 保留接口但不用于膨胀
-        float current_drone_x,
-        float current_drone_y)
+        float drone_radius,
+        float safety_margin)
     {
-        // <第1次修改> 位置：OccupancyGrid2D::update_with_obstacles函数开头
-        // 思路：更新动态地图中心（以无人机当前位置为中心）
-        drone_x = current_drone_x;
-        drone_y = current_drone_y;
-
-        // 1. 衰减旧障碍物（模拟动态环境）
-        for (int i = 0; i < 100; ++i)
+        // 1. 衰减旧障碍物
+        for (int i = 0; i < map_size; ++i)
         {
-            for (int j = 0; j < 100; ++j)
+            for (int j = 0; j < map_size; ++j)
             {
                 if (cells[i][j] > 0)
                 {
@@ -311,270 +392,39 @@ struct OccupancyGrid2D
             }
         }
 
-        // 2. 障碍物膨胀（圆形，半径=障碍物半径+无人机半径，无额外安全裕度）
-        // <第3次修改> 位置：OccupancyGrid2D::update_with_obstacles函数膨胀逻辑
-        // 思路：移除0.2m安全裕度，仅使用障碍物半径+无人机半径
+        // 2. <第 4 次修改> 仅标记障碍物中心，无额外安全裕度
         for (const auto &obs : obstacles)
         {
             int gx, gy;
             if (world_to_grid(obs.position.x(), obs.position.y(), gx, gy))
             {
-                // 膨胀半径计算：障碍物半径 + 无人机半径（无额外安全裕度）
-                float expansion_radius = obs.radius + drone_radius; // 关键修复：移除+0.2f
-                int expansion_cells = static_cast<int>(std::ceil(expansion_radius / resolution));
-
-                // 圆形膨胀
-                for (int dx = -expansion_cells; dx <= expansion_cells; ++dx)
-                {
-                    for (int dy = -expansion_cells; dy <= expansion_cells; ++dy)
-                    {
-                        int nx = gx + dx;
-                        int ny = gy + dy;
-                        if (nx >= 0 && nx < 100 && ny >= 0 && ny < 100)
-                        {
-                            float dist = std::sqrt(dx * dx + dy * dy);
-                            if (dist <= expansion_cells)
-                            {
-                                // 距离中心越近，栅格值越高（100→0线性衰减）
-                                uint8_t val = static_cast<uint8_t>(100 * (1.0f - dist / expansion_cells));
-                                if (val > cells[nx][ny])
-                                {
-                                    cells[nx][ny] = val;
-                                }
-                            }
-                        }
-                    }
-                }
+                cells[gx][gy] = 100;
+                ROS_DEBUG("[MAP] 障碍物标记：(%.2f, %.2f) -> 栅格 (%d,%d)",
+                          obs.position.x(), obs.position.y(), gx, gy);
             }
         }
-    }
-
-    /**
-    @brief 目标点投影到地图边界（处理超出范围的目标）
-    @param start_x 起点X（世界坐标系）
-    @param start_y 起点Y（世界坐标系）
-    @param goal_x 目标X（世界坐标系）
-    @param goal_y 目标Y（世界坐标系）
-    @param projected_x[out] 投影后目标X
-    @param projected_y[out] 投影后目标Y
-    @return bool true=需要投影（目标超出范围），false=无需投影
-    @details
-    投影逻辑：计算起点→目标连线与地图边界的交点
-    地图边界：[drone_x-5.0, drone_x+5.0] × [drone_y-5.0, drone_y+5.0]
-    */
-    bool project_goal_to_boundary(
-        float start_x, float start_y,
-        float goal_x, float goal_y,
-        float &projected_x, float &projected_y) const
-    {
-        // <第2次修改> 位置：新增OccupancyGrid2D::project_goal_to_boundary函数
-        // 思路：目标点超出地图时投影到边界（连线交点法）
-        float min_x = drone_x - 5.0f;
-        float max_x = drone_x + 5.0f;
-        float min_y = drone_y - 5.0f;
-        float max_y = drone_y + 5.0f;
-
-        // 检查目标是否在地图内
-        if (goal_x >= min_x && goal_x <= max_x &&
-            goal_y >= min_y && goal_y <= max_y)
-        {
-            return false; // 无需投影
-        }
-
-        // 计算起点→目标的参数方程：P = start + t*(goal-start)
-        float dx = goal_x - start_x;
-        float dy = goal_y - start_y;
-
-        // 检查与四条边界的交点
-        float t_min = std::numeric_limits<float>::max();
-        float t_candidates[4] = {0};
-        int valid_count = 0;
-
-        // 左边界 x = min_x
-        if (std::abs(dx) > 1e-6f)
-        {
-            float t = (min_x - start_x) / dx;
-            if (t > 0)
-            {
-                float y = start_y + t * dy;
-                if (y >= min_y && y <= max_y)
-                {
-                    t_candidates[valid_count++] = t;
-                }
-            }
-        }
-
-        // 右边界 x = max_x
-        if (std::abs(dx) > 1e-6f)
-        {
-            float t = (max_x - start_x) / dx;
-            if (t > 0)
-            {
-                float y = start_y + t * dy;
-                if (y >= min_y && y <= max_y)
-                {
-                    t_candidates[valid_count++] = t;
-                }
-            }
-        }
-
-        // 下边界 y = min_y
-        if (std::abs(dy) > 1e-6f)
-        {
-            float t = (min_y - start_y) / dy;
-            if (t > 0)
-            {
-                float x = start_x + t * dx;
-                if (x >= min_x && x <= max_x)
-                {
-                    t_candidates[valid_count++] = t;
-                }
-            }
-        }
-
-        // 上边界 y = max_y
-        if (std::abs(dy) > 1e-6f)
-        {
-            float t = (max_y - start_y) / dy;
-            if (t > 0)
-            {
-                float x = start_x + t * dx;
-                if (x >= min_x && x <= max_x)
-                {
-                    t_candidates[valid_count++] = t;
-                }
-            }
-        }
-
-        // 选择最近的交点（最小t>0）
-        for (int i = 0; i < valid_count; ++i)
-        {
-            if (t_candidates[i] < t_min)
-            {
-                t_min = t_candidates[i];
-            }
-        }
-
-        if (t_min == std::numeric_limits<float>::max())
-        {
-            // 无有效交点（起点在边界外），使用最近边界点
-            projected_x = std::max(min_x, std::min(goal_x, max_x));
-            projected_y = std::max(min_y, std::min(goal_y, max_y));
-            ROS_WARN("[A*] 无有效投影交点，使用最近边界点(%.2f,%.2f)", projected_x, projected_y);
-        }
-        else
-        {
-            projected_x = start_x + t_min * dx;
-            projected_y = start_y + t_min * dy;
-        }
-
-        ROS_INFO("[A*] 目标点投影: 原(%.2f,%.2f) → 投影(%.2f,%.2f)",
-                 goal_x, goal_y, projected_x, projected_y);
-        return true;
     }
 };
+
 // ============================================================================
-// 辅助函数：道格拉斯-普克路径简化
+// 核心算法 1：A*全局路径规划
 // ============================================================================
 /**
-@brief 道格拉斯-普克算法简化路径点
-@param points 原始路径点列表
-@param epsilon 简化阈值（米）
-@param simplified 简化后的路径点列表
-@details
-算法原理：递归寻找距离连线最远的点，若距离>阈值则保留该点并递归处理两侧
-@note 阈值0.3米可减少50%~70%路径点，同时保留主要拐点
-*/
-void douglas_peucker(
-    const std::vector<std::pair<float, float>> &points,
-    float epsilon,
-    std::vector<std::pair<float, float>> &simplified)
-{
-    // <第4次修改> 位置：新增douglas_peucker函数
-    // 思路：路径点简化（道格拉斯-普克算法，阈值0.3米）
-    if (points.empty())
-        return;
-
-    // 递归辅助函数
-    std::function<void(int, int)> dp_recursion = [&](int start_idx, int end_idx)
-    {
-        if (end_idx - start_idx <= 1)
-        {
-            if (simplified.empty() || simplified.back() != points[start_idx])
-            {
-                simplified.push_back(points[start_idx]);
-            }
-            if (start_idx != end_idx && (simplified.empty() || simplified.back() != points[end_idx]))
-            {
-                simplified.push_back(points[end_idx]);
-            }
-            return;
-        }
-
-        // 计算起点到终点的直线
-        float x1 = points[start_idx].first;
-        float y1 = points[start_idx].second;
-        float x2 = points[end_idx].first;
-        float y2 = points[end_idx].second;
-        float line_len = std::sqrt((x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1));
-
-        // 寻找最远点
-        int farthest_idx = start_idx;
-        float max_dist = 0;
-
-        for (int i = start_idx + 1; i < end_idx; ++i)
-        {
-            // 点到直线的距离公式
-            float dist = std::abs((y2 - y1) * points[i].first - (x2 - x1) * points[i].second + x2 * y1 - y2 * x1) / line_len;
-            if (dist > max_dist)
-            {
-                max_dist = dist;
-                farthest_idx = i;
-            }
-        }
-
-        // 递归条件
-        if (max_dist > epsilon)
-        {
-            dp_recursion(start_idx, farthest_idx);
-            dp_recursion(farthest_idx, end_idx);
-        }
-        else
-        {
-            if (simplified.empty() || simplified.back() != points[start_idx])
-            {
-                simplified.push_back(points[start_idx]);
-            }
-            if (simplified.empty() || simplified.back() != points[end_idx])
-            {
-                simplified.push_back(points[end_idx]);
-            }
-        }
-    };
-
-    dp_recursion(0, points.size() - 1);
-}
-// ============================================================================
-// 核心算法1：A*全局路径规划（动态地图+目标投影）
-// ============================================================================
+ * @brief A*全局路径规划函数
+ */
 int astar_plan(
-    OccupancyGrid2D &grid, // 非const：需要更新地图中心
+    const OccupancyGrid2D &grid,
     float start_x, float start_y,
     float goal_x, float goal_y,
     float *path_x, float *path_y,
     int max_points);
+
 // ============================================================================
-// 核心算法2：增量A*路径规划（重规划使用）
+// 核心算法 2：走廊生成器
 // ============================================================================
-int incremental_astar_plan(
-    OccupancyGrid2D &grid, // 非const：需要更新地图中心
-    float start_x, float start_y,
-    float goal_x, float goal_y,
-    float *path_x, float *path_y,
-    int max_points);
-// ============================================================================
-// 核心算法3：走廊生成器（B-spline插值 + 曲率动态宽度）
-// ============================================================================
+/**
+ * @brief 走廊生成器
+ */
 int generate_corridor(
     const float *astar_path_x,
     const float *astar_path_y,
@@ -584,9 +434,16 @@ int generate_corridor(
     float *corridor_y,
     float *corridor_width,
     int max_size);
+
 // ============================================================================
-// 核心算法4：增强VFH+避障（含走廊软约束 + 异常检测）
+// 核心算法 3：增强 VFH+ 避障
 // ============================================================================
+/**
+ * @brief 增强 VFH+ 避障函数
+ *
+ * <第 2 次修改> 优化振荡检测阈值
+ * <第 4 次修改> 参数从 yaml 读取
+ */
 bool vfh_plus_with_corridor(
     float target_x_rel,
     float target_y_rel,
@@ -601,4 +458,5 @@ bool vfh_plus_with_corridor(
     int corridor_size,
     bool enable_corridor,
     bool &out_need_replan);
+
 #endif // ASTAR_H
