@@ -18,7 +18,7 @@ float UAV_radius = 0.3f;
 float time_final = 70.0f;
 
 // 避障参数
-float safe_margin = 0.4f;
+float safe_margin = 0.1f;
 float MAX_SPEED = 0.9f;
 float MIN_SAFE_DISTANCE = 0.25f;
 float CORRIDOR_WIDTH_BASE = 0.8f;
@@ -848,8 +848,8 @@ bool vfh_plus_with_corridor(
   }
 
   float speed_factor = 1.0f - (forward_congestion / 60.0f) * 0.6f;
-  if (speed_factor < 0.3f)
-    speed_factor = 0.3f;
+  if (speed_factor < 0.5f)
+    speed_factor = 0.5f;
   float forward_speed = max_speed * speed_factor;
 
   float TIME_STEP = 0.1f;
