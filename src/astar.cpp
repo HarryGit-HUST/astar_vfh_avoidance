@@ -1346,7 +1346,143 @@ bool vfh_plus_with_corridor(
 
   return (dist_now < 0.4f);
 }
+// ============================================================================
+// 函数实现部分 (必须存在于 astar.cpp 中)
+// ============================================================================
 
+// 1. MAVROS 状态回调实现
+void state_cb(const mavros_msgs::State::ConstPtr &msg)
+{
+  mavros_connection_state = *msg;
+}
+
+// 2. 里程计回调实现
+void local_pos_cb(const nav_msgs::Odometry::ConstPtr &msg)
+{
+  local_pos = *msg;
+  tf::quaternionMsgToTF(local_pos.pose.pose.orientation, quat);
+  tf::Matrix3x3(quat).getRPY(roll, pitch, yaw);
+  current_pos = Eigen::Vector2f(local_pos.pose.pose.position.x, local_pos.pose.pose.position.y);
+
+  // 机体速度→世界速度转换
+  tf::Vector3 body_vel(local_pos.twist.twist.linear.x, local_pos.twist.twist.linear.y, local_pos.twist.twist.linear.z);
+  tf::Matrix3x3 rot_matrix(quat);
+  tf::Vector3 world_vel = rot_matrix * body_vel;
+  current_vel = Eigen::Vector2f(world_vel.x(), world_vel.y());
+
+  // 首次高度>0.1m 时记录起飞点
+  if (flag_init_position == false && (local_pos.pose.pose.position.z > 0.1))
+  {
+    init_position_x_take_off = local_pos.pose.pose.position.x;
+    init_position_y_take_off = local_pos.pose.pose.position.y;
+    init_position_z_take_off = local_pos.pose.pose.position.z;
+    init_yaw_take_off = yaw;
+    flag_init_position = true;
+    ROS_INFO("[ODOM] 起飞点已初始化：(%.2f, %.2f, %.2f)",
+             init_position_x_take_off, init_position_y_take_off, init_position_z_take_off);
+  }
+}
+
+// 3. 位置巡航控制实现
+bool mission_pos_cruise(float x, float y, float z, float target_yaw, float error_max)
+{
+  if (mission_pos_cruise_flag == false)
+  {
+    mission_pos_cruise_last_position_x = local_pos.pose.pose.position.x;
+    mission_pos_cruise_last_position_y = local_pos.pose.pose.position.y;
+    mission_pos_cruise_flag = true;
+    mission_cruise_start_time = ros::Time::now();
+    mission_cruise_timeout_flag = false;
+  }
+
+  ros::Duration elapsed_time = ros::Time::now() - mission_cruise_start_time;
+  if (elapsed_time.toSec() > mission_cruise_timeout && !mission_cruise_timeout_flag)
+  {
+    ROS_WARN("[巡航超时] 已耗时%.1f 秒（阈值%.1f 秒），强制切换下一个任务！", elapsed_time.toSec(), mission_cruise_timeout);
+    mission_cruise_timeout_flag = true;
+    mission_pos_cruise_flag = false;
+    return true;
+  }
+
+  setpoint_raw.type_mask = 8 + 16 + 32 + 64 + 128 + 256 + 512 + 2048;
+  setpoint_raw.coordinate_frame = 1;
+  setpoint_raw.position.x = x + init_position_x_take_off;
+  setpoint_raw.position.y = y + init_position_y_take_off;
+  setpoint_raw.position.z = z + init_position_z_take_off;
+  setpoint_raw.yaw = target_yaw;
+
+  if (fabs(local_pos.pose.pose.position.x - x - init_position_x_take_off) < error_max &&
+      fabs(local_pos.pose.pose.position.y - y - init_position_y_take_off) < error_max &&
+      fabs(local_pos.pose.pose.position.z - z - init_position_z_take_off) < error_max &&
+      fabs(yaw - target_yaw) < 0.1)
+  {
+    ROS_INFO("到达目标点，巡航点任务完成");
+    mission_cruise_timeout_flag = false;
+    mission_pos_cruise_flag = false;
+    return true;
+  }
+  return false;
+}
+
+// 4. 精确降落控制实现
+bool precision_land(float err_max)
+{
+  if (!precision_land_init_position_flag)
+  {
+    precision_land_init_position_x = local_pos.pose.pose.position.x;
+    precision_land_init_position_y = local_pos.pose.pose.position.y;
+    precision_land_last_time = ros::Time::now();
+    precision_land_init_position_flag = true;
+  }
+
+  if (fabs(local_pos.pose.pose.position.x - precision_land_init_position_x) < err_max / 2 &&
+          fabs(local_pos.twist.twist.linear.x) < err_max / 10 &&
+          fabs(local_pos.pose.pose.position.y - precision_land_init_position_y) < err_max / 2 &&
+          fabs(local_pos.twist.twist.linear.y) < err_max / 10 ||
+      ros::Time::now() - precision_land_last_time > ros::Duration(10.0))
+  {
+    hovor_done = true;
+    precision_land_last_time = ros::Time::now();
+  }
+
+  if (!land_done && hovor_done && (fabs(local_pos.pose.pose.position.z - init_position_z_take_off) < err_max / 5 || ros::Time::now() - precision_land_last_time > ros::Duration(5.0)))
+  {
+    land_done = true;
+    precision_land_last_time = ros::Time::now();
+  }
+
+  if (land_done && ros::Time::now() - precision_land_last_time > ros::Duration(2.0))
+  {
+    ROS_INFO("Precision landing complete.");
+    precision_land_init_position_flag = false;
+    hovor_done = false;
+    land_done = false;
+    return true;
+  }
+
+  setpoint_raw.position.x = precision_land_init_position_x;
+  setpoint_raw.position.y = precision_land_init_position_y;
+
+  if (!land_done && !hovor_done)
+  {
+    setpoint_raw.position.z = ALTITUDE;
+    ROS_INFO("悬停中");
+  }
+  else if (!land_done)
+  {
+    setpoint_raw.position.z = (local_pos.pose.pose.position.z + 0.15) * 0.75 - 0.15;
+    ROS_INFO("降落中");
+  }
+  else
+  {
+    setpoint_raw.position.z = local_pos.pose.pose.position.z - 0.02;
+    ROS_INFO("稳定中");
+  }
+
+  setpoint_raw.type_mask = 8 + 16 + 32 + 64 + 128 + 256 + 512;
+  setpoint_raw.coordinate_frame = 1;
+  return false;
+}
 // ============================================================================
 // 主函数
 // ============================================================================
