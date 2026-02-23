@@ -1,4 +1,7 @@
 #include <astar.h>
+#include <iostream>
+#include <algorithm>
+#include <cmath>
 
 // ============================================================================
 // 全局变量定义
@@ -76,11 +79,14 @@ float corridor_y[MAX_CORRIDOR_POINTS] = {0};
 float corridor_width[MAX_CORRIDOR_POINTS] = {0};
 int corridor_size = 0;
 
+/*
 // RViz 可视化发布器定义
 ros::Publisher g_obstacle_marker_pub;
 ros::Publisher g_astar_path_pub;
 ros::Publisher g_corridor_pub;
 ros::Publisher g_vfh_grid_pub;
+
+*/
 ros::Publisher mavros_setpoint_pos_pub;
 
 void print_param()
@@ -94,7 +100,73 @@ void print_param()
 }
 
 // ============================================================================
-// 核心算法 1：A*全局路径规划
+// OccupancyGrid2D 实现
+// ============================================================================
+OccupancyGrid2D::OccupancyGrid2D()
+{
+  resolution = 0.1f;
+  origin_x = -5.0f;
+  origin_y = -5.0f;
+  for (int i = 0; i < 100; ++i)
+    for (int j = 0; j < 100; ++j)
+      cells[i][j] = 0;
+}
+
+bool OccupancyGrid2D::world_to_grid(float wx, float wy, int &gx, int &gy) const
+{
+  gx = static_cast<int>((wx - origin_x) / resolution);
+  gy = static_cast<int>((wy - origin_y) / resolution);
+  return (gx >= 0 && gx < 100 && gy >= 0 && gy < 100);
+}
+
+void OccupancyGrid2D::grid_to_world(int gx, int gy, float &wx, float &wy) const
+{
+  wx = origin_x + gx * resolution;
+  wy = origin_y + gy * resolution;
+}
+
+void OccupancyGrid2D::update_with_obstacles(const std::vector<Obstacle> &obstacles, float drone_radius, float safety_margin)
+{
+  // 衰减
+  for (int i = 0; i < 100; ++i)
+    for (int j = 0; j < 100; ++j)
+      if (cells[i][j] > 0)
+        cells[i][j] = std::max(static_cast<uint8_t>(0), static_cast<uint8_t>(cells[i][j] - 2));
+
+  // 膨胀标记 (仅标记中心，VFH+ 负责精细膨胀)
+  // 注意：这里我们只标记中心点，因为 VFH+ 会做更细致的局部膨胀
+  // 如果你希望 A* 也避开一定范围，可以取消下面注释中的膨胀逻辑
+
+  float expansion_radius = drone_radius;
+  int expansion_cells = static_cast<int>(std::ceil(expansion_radius / resolution));
+
+  for (const auto &obs : obstacles)
+  {
+    int gx, gy;
+    if (world_to_grid(obs.position.x(), obs.position.y(), gx, gy))
+    {
+      cells[gx][gy] = 100;
+
+      // 如果需要 A* 也膨胀，解开以下代码
+      for (int dx = -expansion_cells; dx <= expansion_cells; ++dx)
+      {
+        for (int dy = -expansion_cells; dy <= expansion_cells; ++dy)
+        {
+          int nx = gx + dx, ny = gy + dy;
+          if (nx >= 0 && nx < 100 && ny >= 0 && ny < 100)
+          {
+            float dist = std::sqrt(dx * dx + dy * dy);
+            if (dist <= expansion_cells)
+              cells[nx][ny] = 100;
+          }
+        }
+      }
+    }
+  }
+}
+
+// ============================================================================
+// A* 算法实现
 // ============================================================================
 int astar_plan(
     const OccupancyGrid2D &grid,
@@ -876,45 +948,46 @@ bool vfh_plus_with_corridor(
       ROS_INFO("[VFH+] 振荡恢复完成");
     }
   }
+  /*
+   static int target_blocked_count = 0;
+      bool target_blocked = false;
 
-  static int target_blocked_count = 0;
-  bool target_blocked = false;
-
-  float ray_steps = std::max(5.0f, dist_to_target / 0.2f);
-  for (int s = 1; s <= static_cast<int>(ray_steps); ++s)
-  {
-    float ratio = static_cast<float>(s) / ray_steps;
-    float check_x = drone_x + dx_to_target * ratio;
-    float check_y = drone_y + dy_to_target * ratio;
-
-    for (const auto &obs : obstacles)
-    {
-      float dx = check_x - obs.position.x();
-      float dy = check_y - obs.position.y();
-      float dist = std::sqrt(dx * dx + dy * dy);
-      if (dist < obs.radius + uav_radius + safe_margin)
+      float ray_steps = std::max(5.0f, dist_to_target / 0.2f);
+      for (int s = 1; s <= static_cast<int>(ray_steps); ++s)
       {
-        target_blocked = true;
-        break;
-      }
-    }
-    if (target_blocked)
-      break;
-  }
+          float ratio = static_cast<float>(s) / ray_steps;
+          float check_x = drone_x + dx_to_target * ratio;
+          float check_y = drone_y + dy_to_target * ratio;
 
-  if (target_blocked)
-  {
-    target_blocked_count++;
-    if (target_blocked_count >= 5)
-    {
-      ROS_WARN("[VFH+] 目标不可达！连续 5 帧被阻挡");
-      out_need_replan = true;
-    }
-  }
-  else
-  {
-    target_blocked_count = std::max(0, target_blocked_count - 1);
-  }
+          for (const auto &obs : obstacles)
+          {
+              float dx = check_x - obs.position.x();
+              float dy = check_y - obs.position.y();
+              float dist = std::sqrt(dx * dx + dy * dy);
+              if (dist < obs.radius + uav_radius + safe_margin)
+              {
+                  target_blocked = true;
+                  break;
+              }
+          }
+          if (target_blocked)
+              break;
+      }
+
+      if (target_blocked)
+      {
+          target_blocked_count++;
+          if (target_blocked_count >= 5)
+          {
+              ROS_WARN("[VFH+] 目标不可达！连续 5 帧被阻挡");
+              out_need_replan = true;
+          }
+      }
+      else
+      {
+          target_blocked_count = std::max(0, target_blocked_count - 1);
+      }
+  */
 
   static std::vector<Obstacle> known_obstacles;
   bool new_large_obstacle = false;
@@ -1307,8 +1380,8 @@ bool vfh_plus_with_corridor(
   }
 
   float speed_factor = 1.0f - (forward_congestion / 60.0f) * 0.6f;
-  if (speed_factor < 0.3f)
-    speed_factor = 0.3f;
+  if (speed_factor < 0.5f)
+    speed_factor = 0.5f;
   float forward_speed = max_speed * speed_factor;
 
   float TIME_STEP = 0.1f;
@@ -1483,6 +1556,7 @@ bool precision_land(float err_max)
   setpoint_raw.coordinate_frame = 1;
   return false;
 }
+
 // ============================================================================
 // 主函数
 // ============================================================================
@@ -1498,11 +1572,13 @@ int main(int argc, char **argv)
   mavros_setpoint_pos_pub = nh.advertise<mavros_msgs::PositionTarget>("/mavros/setpoint_raw/local", 100);
   ros::Subscriber livox_sub = nh.subscribe<livox_ros_driver::CustomMsg>("/livox/lidar", 10, livox_cb_wrapper);
 
-  // RViz 可视化发布器初始化
+  /*
+   // RViz 可视化发布器初始化
   g_obstacle_marker_pub = nh.advertise<visualization_msgs::MarkerArray>("/obstacle_markers", 20);
   g_astar_path_pub = nh.advertise<nav_msgs::Path>("/astar_path", 20);
   g_corridor_pub = nh.advertise<visualization_msgs::Marker>("/corridor", 20);
   g_vfh_grid_pub = nh.advertise<nav_msgs::OccupancyGrid>("/vfh_grid", 20);
+  */
 
   ros::ServiceClient arming_client = nh.serviceClient<mavros_msgs::CommandBool>("mavros/cmd/arming");
   ros::ServiceClient set_mode_client = nh.serviceClient<mavros_msgs::SetMode>("mavros/set_mode");
