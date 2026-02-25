@@ -14,6 +14,15 @@
   <build_depend>mavros_msgs</build_depend>
   <build_depend>rospy</build_depend>
   <build_depend>livox_ros_driver</build_depend>
+  <build_depend>visualization_msgs</build_depend>
+  <build_depend>nav_msgs</build_depend>
+  <build_depend>tf</build_depend>
+  <build_depend>pcl_ros</build_depend>
+
+  <exec_depend>visualization_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>tf</exec_depend>
+  <exec_depend>pcl_ros</exec_depend>
   <exec_depend>livox_ros_driver</exec_depend>
   <exec_depend>rospy</exec_depend>
   <exec_depend>roscpp</exec_depend>

@@ -1,48 +1,15 @@
-# ============================================================================
-# 避障系统参数配置文件
-# ============================================================================
+target_x: 6.0
+target_y: 0.0
+target_z: 0.0
 
-# --- 基础参数 ---
-err_max: 0.2              # 位置误差阈值（米）
-if_debug: 1               # 调试模式开关（1=开启，0=关闭）
+debug_mode: true
 
-# --- 任务参数 ---
-target_x: 5.0             # 目标点 X 坐标（相对起飞点，米）
-target_y: 0.0             # 目标点 Y 坐标（相对起飞点，米）
-target_yaw: 0.0           # 目标航向角（弧度）
-time_final: 70.0          # 任务超时时间（秒）
-
-# --- 无人机参数 ---
-UAV_radius: 0.3           # 无人机等效半径（米）
-
-# --- 避障参数 ---
-safe_margin: 0.1          # VFH+ 安全裕度（米）
-MAX_SPEED: 1.9            # 最大前进速度（米/秒）
-MIN_SAFE_DISTANCE: 0.25   # 力场计算最小距离（米）
-
-# --- 走廊参数 ---
-CORRIDOR_WIDTH_BASE: 0.8          # 走廊基础宽度（米）
-ENABLE_CORRIDOR: true             # 是否启用走廊约束
-CORRIDOR_CURVATURE_SCALE: 1.2     # 急弯加宽系数
-CORRIDOR_CURVATURE_THRESHOLD: 0.4 # 曲率阈值（1/米）
-
-# --- 重规划参数 ---
-REPLAN_COOLDOWN: 5.0      # 重规划冷却时间（秒）
-
-# --- 全局地图参数 ---
-GLOBAL_MAP_SIZE: 20.0           # 全局地图尺寸（米）
-GLOBAL_MAP_RESOLUTION: 0.15     # 全局地图分辨率（米/栅格）
-ASTAR_SAFETY_MARGIN: 0.0        # A*安全裕度（米），0 表示无额外裕度
-
-# --- 振荡检测参数 ---
-OSCILLATION_POS_THRESHOLD: 0.15     # 振荡检测位置阈值（米）
-OSCILLATION_ANGLE_THRESHOLD: 120.0  # 振荡检测角度阈值（度）
-OSCILLATION_TIME_WINDOW: 3.0        # 振荡检测时间窗口（秒）
-OSCILLATION_RECOVERY_DURATION: 2.0  # 振荡恢复持续时间（秒）
-
-# ===== 调参指南 =====
-# 场景          | CORRIDOR_WIDTH_BASE | MAX_SPEED | FRONT_OBSTACLE_TH
-# --------------|---------------------|-----------|-------------------
-# 开阔场地      | 1.0                 | 1.2       | 3
-# 窄通道(1.5m)  | 0.7                 | 0.7       | 1
-# 默认值        | 0.8                 | 0.9       | 2
+planner:
+  uav_radius: 0.3
+  safe_margin: 0.2
+  max_speed: 1.0
+  min_safe_dist: 0.3
+  
+  corridor_width: 1.2
+  replan_cooldown: 1.5
+  enable_corridor: true
