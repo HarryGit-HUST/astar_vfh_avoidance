@@ -1,10 +1,10 @@
 <launch>
-  <!-- 启动规划节点 -->
-  <node pkg="astar" type="astar" name="astar_node" output="screen">
+    <!-- 加载参数 -->
     <rosparam command="load" file="$(find astar)/config/astar.yaml" />
-  </node>
-  
-  <!-- 启动 RViz -->
-  <!-- 确保 planner.rviz 中 Global Options 的 Fixed Frame 是 "map" -->
-  <node pkg="rviz" type="rviz" name="rviz" args="-d $(find astar)/config/planner.rviz" />
+
+    <!-- 启动规划节点 -->
+    <node pkg="astar" type="astar" name="astar_node" output="screen" />
+    
+    <!-- 启动 RViz (增加 5秒 延时，防止启动崩溃) -->
+    <node pkg="rviz" type="rviz" name="rviz" args="-d $(find astar)/config/planner.rviz" launch-prefix="bash -c 'sleep 5; $0 $@' " />
 </launch>

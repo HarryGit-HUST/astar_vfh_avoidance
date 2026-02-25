@@ -1,15 +1,16 @@
 /**
  * @file astar.cpp
- * @brief 修复版：YAML读取修复 + 地图记忆衰减机制
+ * @brief 工程修复版：解决启动崩溃、NaN错误、起飞点死锁问题
  */
 #include "astar.h"
 #include <iostream>
 #include <algorithm>
 #include <cmath>
 #include <clocale>
+#include <nav_msgs/OccupancyGrid.h>
 
 // ============================================================================
-// 全局变量 (与 new_detect_obs.h 兼容)
+// 1. 全局变量定义 (必须与 new_detect_obs.h 中的 extern 严格对应)
 // ============================================================================
 float target_x = 0.0f;
 float target_y = 0.0f;
@@ -21,15 +22,22 @@ float init_position_z_take_off = 0;
 float init_yaw_take_off = 0;
 bool flag_init_position = false;
 
+// ============================================================================
+// 其他全局变量
+// ============================================================================
+int mission_step = 0; // 0:Init, 1:Takeoff, 2:Avoid, 3:Land
+
 mavros_msgs::PositionTarget setpoint_raw;
 mavros_msgs::State mavros_connection_state;
 nav_msgs::Odometry local_pos;
 double current_yaw = 0.0;
 tf::Quaternion quat;
 
+// 状态记录
 float init_pos_x = 0, init_pos_y = 0, init_pos_z = 0;
 bool flag_init_pos = false;
 
+// 规划路径缓存
 std::vector<Eigen::Vector2f> global_path_raw;
 std::vector<Eigen::Vector2f> global_path_smooth;
 ros::Time last_replan_time;
@@ -48,50 +56,57 @@ struct Config
   float astar_weight;
   float replan_cooldown;
   float check_radius;
-
-  // 新增：地图衰减参数
-  int map_decay_rate; // 每次更新减少多少数值
+  int map_decay_rate;
 } cfg;
 
+// ROS Publishers
 ros::Publisher pub_setpoint;
 ros::Publisher pub_viz_path_raw;
 ros::Publisher pub_viz_path_smooth;
 ros::Publisher pub_viz_vfh;
-ros::Publisher pub_viz_map; // 地图发布
+ros::Publisher pub_viz_map;
 
 // ============================================================================
-// 参数加载 (修复：使用私有句柄)
+// 参数加载
 // ============================================================================
 void load_parameters(ros::NodeHandle &nh)
 {
-  // 这里的 nh 必须是 ros::NodeHandle("~")
-
-  // 1. 加载到全局变量 (兼容感知模块)
   nh.param<float>("target_x", target_x, 5.0f);
   nh.param<float>("target_y", target_y, 0.0f);
   nh.param<float>("debug_mode", if_debug, 1.0f);
 
-  // 2. 加载内部配置
   nh.param<float>("target_z", cfg.target_z, 1.0f);
   nh.param<float>("planner/uav_radius", cfg.uav_radius, 0.3f);
   nh.param<float>("planner/safe_margin", cfg.safe_margin, 0.3f);
   nh.param<float>("planner/max_speed", cfg.max_speed, 0.8f);
-
+  nh.param<float>("planner/min_safe_dist", cfg.min_safe_dist, 0.3f);
   nh.param<float>("planner/lookahead_dist", cfg.lookahead_dist, 1.5f);
   nh.param<float>("planner/astar_weight", cfg.astar_weight, 1.5f);
   nh.param<float>("planner/replan_cooldown", cfg.replan_cooldown, 1.0f);
-
-  nh.param<int>("planner/map_decay_rate", cfg.map_decay_rate, 5); // 默认每帧衰减5 (共100，约20帧消失)
+  nh.param<int>("planner/map_decay_rate", cfg.map_decay_rate, 5);
 
   cfg.check_radius = cfg.uav_radius + 0.1f;
 
-  ROS_INFO("=== 参数加载成功 (Private Namespace) ===");
-  ROS_INFO("Target Rel: (%.2f, %.2f)", target_x, target_y);
-  ROS_INFO("Map Decay Rate: %d", cfg.map_decay_rate);
+  ROS_INFO("=== 参数加载完成 ===");
+  ROS_INFO("目标: (%.2f, %.2f), 速度: %.1f", target_x, target_y, cfg.max_speed);
 }
 
 // ============================================================================
-// 可视化
+// 关键修复：Livox 回调代理
+// 作用：在未定位完成或未开始任务前，屏蔽雷达数据，防止 NaN 错误
+// ============================================================================
+void local_livox_cb(const livox_ros_driver::CustomMsg::ConstPtr &msg)
+{
+  // 1. 如果没有初始化起飞点，绝对不能处理点云 (会导致坐标变换 NaN)
+  if (!flag_init_position)
+    return;
+
+  // 2. 只有在需要感知的时候才处理 (可选，这里为了安全始终运行，但上面那个判定是必须的)
+  livox_cb_wrapper(msg);
+}
+
+// ============================================================================
+// 可视化函数实现 (修复 Quaternion 警告)
 // ============================================================================
 void pub_viz_astar_path(const std::vector<Eigen::Vector2f> &path)
 {
@@ -104,6 +119,7 @@ void pub_viz_astar_path(const std::vector<Eigen::Vector2f> &path)
     pose.pose.position.x = pt.x();
     pose.pose.position.y = pt.y();
     pose.pose.position.z = init_pos_z + cfg.target_z;
+    pose.pose.orientation.w = 1.0; // 必须设置 w=1
     msg.poses.push_back(pose);
   }
   pub_viz_path_raw.publish(msg);
@@ -129,13 +145,14 @@ void pub_viz_smooth_path(const std::vector<Eigen::Vector2f> &path)
     mk.pose.position.x = path[i].x();
     mk.pose.position.y = path[i].y();
     mk.pose.position.z = init_pos_z + cfg.target_z;
-    mk.scale.x = 0.1;
-    mk.scale.y = 0.1;
-    mk.scale.z = 0.1;
+    mk.scale.x = 0.15;
+    mk.scale.y = 0.15;
+    mk.scale.z = 0.15;
     mk.color.r = 0.0;
-    mk.color.g = 1.0;
+    mk.color.g = 0.8;
     mk.color.b = 1.0;
-    mk.color.a = 0.8;
+    mk.color.a = 0.6;
+    mk.pose.orientation.w = 1.0; // 修复警告
     ma.markers.push_back(mk);
   }
   pub_viz_path_smooth.publish(ma);
@@ -192,7 +209,6 @@ void pub_viz_grid_map(const OccupancyGrid2D &grid)
   {
     int x = i % msg.info.width;
     int y = i / msg.info.width;
-    // 显示阈值：大于 50 认为是障碍，显示黑色
     msg.data[i] = (grid.cells[x][y] > 50) ? 100 : 0;
   }
   pub_viz_map.publish(msg);
@@ -230,7 +246,7 @@ std::vector<Eigen::Vector2f> BSplinePlanner::generate_smooth_path(const std::vec
 }
 
 // ============================================================================
-// 地图核心：动态衰减逻辑
+// 地图核心 (修复起飞点被占用问题)
 // ============================================================================
 OccupancyGrid2D::OccupancyGrid2D()
 {
@@ -259,29 +275,32 @@ bool OccupancyGrid2D::is_occupied(int gx, int gy) const
 {
   if (gx < 0 || gx >= GRID_W || gy < 0 || gy >= GRID_H)
     return true;
-  // 只有当占用值 > 50 时才视为障碍，这提供了缓冲
   return cells[gx][gy] > 50;
 }
 
 void OccupancyGrid2D::update_with_decay(const std::vector<Obstacle> &obstacles, float drone_r, float safe_margin)
 {
-  // 1. 全局衰减 (记忆功能的核心)
-  // 不再直接清零，而是慢慢减小数值
+  // 1. 动态衰减
   for (int i = 0; i < GRID_W; ++i)
   {
     for (int j = 0; j < GRID_H; ++j)
     {
       if (cells[i][j] > 0)
-      {
         cells[i][j] = std::max(0, cells[i][j] - cfg.map_decay_rate);
-      }
     }
   }
 
-  // 2. 观测更新 (观测到的地方设为 100)
   float total_r = drone_r + safe_margin;
+  Eigen::Vector2f drone_p(local_pos.pose.pose.position.x, local_pos.pose.pose.position.y);
+
   for (const auto &obs : obstacles)
   {
+    // === 关键修复：灯下黑策略 ===
+    // 如果障碍物距离无人机中心过近，认为是机身本身或噪点，强制忽略
+    // 否则起飞时 A* 会认为起点被堵死
+    if ((obs.position - drone_p).norm() < drone_r + 0.1)
+      continue;
+
     int gx, gy;
     if (!world_to_grid(obs.position.x(), obs.position.y(), gx, gy))
       continue;
@@ -299,9 +318,7 @@ void OccupancyGrid2D::update_with_decay(const std::vector<Obstacle> &obstacles, 
         if (nx >= 0 && nx < GRID_W && ny >= 0 && ny < GRID_H)
         {
           if (dx * dx + dy * dy <= r_sq)
-          {
-            cells[nx][ny] = 100; // 刷新障碍物存在感
-          }
+            cells[nx][ny] = 100;
         }
       }
     }
@@ -321,7 +338,6 @@ bool run_astar(const OccupancyGrid2D &grid, Eigen::Vector2f start, Eigen::Vector
     return false;
   }
 
-  // 严密性：如果起点被老障碍物的余影挡住，尝试搜索附近
   auto find_free = [&](int &cx, int &cy) -> bool
   {
     if (!grid.is_occupied(cx, cy))
@@ -436,21 +452,21 @@ bool run_astar(const OccupancyGrid2D &grid, Eigen::Vector2f start, Eigen::Vector
     for (size_t i = 1; i < raw_pts.size() - 1; ++i)
     {
       if ((raw_pts[i] - out_path.back()).norm() > 0.6)
-      { // 抽稀
+      {
         out_path.push_back(raw_pts[i]);
       }
     }
     out_path.push_back(raw_pts.back());
   }
-
   return true;
 }
 
 // ============================================================================
-// 增量检测 (使用双重阈值防止震荡)
+// 增量检测 (修复：空路径处理)
 // ============================================================================
 bool is_path_blocked(const std::vector<Eigen::Vector2f> &path, const OccupancyGrid2D &grid, float check_radius)
 {
+  // 关键修复：如果路径为空（刚起飞尚未规划），返回 true 强制规划，但不打印警告
   if (path.empty())
     return true;
 
@@ -473,13 +489,10 @@ bool is_path_blocked(const std::vector<Eigen::Vector2f> &path, const OccupancyGr
     if ((path[i] - drone_pos).norm() > 6.0)
       break;
 
-    // 检查地图上的占用情况
     int gx, gy;
     if (grid.world_to_grid(path[i].x(), path[i].y(), gx, gy))
     {
-      // 如果已经在障碍物里 (值 > 50)，肯定堵了
-      // 这里我们用更严格的判定：只要 grid 值 > 80 (确信障碍) 就认为堵了
-      // 衰减中的障碍 (50-80) 允许穿过，这就是“迟滞”
+      // 只检测确信的障碍 (80以上)，避免被衰减中的阴影吓停
       if (grid.cells[gx][gy] > 80)
         return true;
     }
@@ -618,6 +631,16 @@ void local_pos_cb(const nav_msgs::Odometry::ConstPtr &msg)
   tf::quaternionMsgToTF(local_pos.pose.pose.orientation, quat);
   double r, p;
   tf::Matrix3x3(quat).getRPY(r, p, current_yaw);
+
+  if (!flag_init_position && local_pos.pose.pose.position.z > -0.5)
+  {
+    init_position_x_take_off = local_pos.pose.pose.position.x;
+    init_position_y_take_off = local_pos.pose.pose.position.y;
+    init_position_z_take_off = local_pos.pose.pose.position.z;
+    init_yaw_take_off = current_yaw;
+    flag_init_position = true;
+    ROS_INFO("起飞点已初始化: (%.2f, %.2f, %.2f)", init_position_x_take_off, init_position_y_take_off, init_position_z_take_off);
+  }
 }
 
 int main(int argc, char **argv)
@@ -625,15 +648,15 @@ int main(int argc, char **argv)
   setlocale(LC_ALL, "");
   ros::init(argc, argv, "astar_node");
 
-  // 关键修正：使用私有句柄加载参数
   ros::NodeHandle nh("~");
-  ros::NodeHandle public_nh; // 用于订阅发布
+  ros::NodeHandle public_nh;
 
   load_parameters(nh);
 
   ros::Subscriber sub_state = public_nh.subscribe("mavros/state", 10, state_cb);
   ros::Subscriber sub_pos = public_nh.subscribe("/mavros/local_position/odom", 10, local_pos_cb);
-  ros::Subscriber sub_livox = public_nh.subscribe("/livox/lidar", 10, livox_cb_wrapper);
+  // 使用代理回调
+  ros::Subscriber sub_livox = public_nh.subscribe("/livox/lidar", 10, local_livox_cb);
 
   pub_setpoint = public_nh.advertise<mavros_msgs::PositionTarget>("/mavros/setpoint_raw/local", 10);
   pub_viz_path_raw = public_nh.advertise<nav_msgs::Path>("/viz/raw_path", 1);
@@ -677,7 +700,6 @@ int main(int argc, char **argv)
   bool has_global_plan = false;
   ros::Time last_req = ros::Time::now();
 
-  // 全局地图实例
   OccupancyGrid2D global_grid;
 
   while (ros::ok())
@@ -725,6 +747,9 @@ int main(int argc, char **argv)
       setpoint_raw.position.x = init_pos_x;
       setpoint_raw.position.y = init_pos_y;
 
+      // 清理起飞点的地图障碍 (防止 A* 以为在墙里)
+      global_grid.update_with_decay(obstacles, cfg.uav_radius, cfg.safe_margin);
+
       if (std::abs(local_pos.pose.pose.position.z - target_abs_z) < 0.2)
       {
         mission_step = 2;
@@ -741,7 +766,6 @@ int main(int argc, char **argv)
       // 1. 更新全局地图 (带衰减)
       global_grid.update_with_decay(obstacles, cfg.uav_radius, cfg.safe_margin);
 
-      // 发布地图调试
       static int cnt = 0;
       if (cnt++ % 5 == 0)
         pub_viz_grid_map(global_grid);
@@ -751,9 +775,11 @@ int main(int argc, char **argv)
       bool cooldown_over = (ros::Time::now() - last_replan_time).toSec() > cfg.replan_cooldown;
 
       // 3. 重规划决策
+      // 注意：如果 blocked 为 true，这里会打印 WARN (is_path_blocked 内部不打印，留给这里)
+      // 仅当路径真的存在且被堵，或者根本没路径时，才规划
       if (!has_global_plan || (blocked && cooldown_over))
       {
-        if (blocked)
+        if (blocked && has_global_plan)
           ROS_WARN("路径被动态障碍物截断，重规划...");
 
         if (run_astar(global_grid, curr, goal, global_path_raw))
