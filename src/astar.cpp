@@ -83,7 +83,7 @@ void load_parameters(ros::NodeHandle &nh)
   nh.param<float>("planner/lookahead_dist", cfg.lookahead_dist, 1.5f);
   nh.param<float>("planner/astar_weight", cfg.astar_weight, 1.5f);
   nh.param<float>("planner/replan_cooldown", cfg.replan_cooldown, 1.0f);
-  nh.param<int>("planner/map_decay_rate", cfg.map_decay_rate, 5);
+  nh.param<int>("planner/map_decay_rate", cfg.map_decay_rate, 2);
 
   cfg.check_radius = cfg.uav_radius + 0.1f;
 
@@ -278,15 +278,26 @@ bool OccupancyGrid2D::is_occupied(int gx, int gy) const
   return cells[gx][gy] > 50;
 }
 
+// 在 OccupancyGrid2D 结构体中增加一个常量
+// static const int HIGH_CONFIDENCE = 90;
+
 void OccupancyGrid2D::update_with_decay(const std::vector<Obstacle> &obstacles, float drone_r, float safe_margin)
 {
-  // 1. 动态衰减
+  // 1. 动态衰减 (优化版：记忆增强)
   for (int i = 0; i < GRID_W; ++i)
   {
     for (int j = 0; j < GRID_H; ++j)
     {
       if (cells[i][j] > 0)
-        cells[i][j] = std::max(0, cells[i][j] - cfg.map_decay_rate);
+      {
+        // 如果是确信的障碍物 (>90)，衰减速度减半，或者仅当 cfg.map_decay_rate 很大时才衰减
+        // 这里我们做一个保护：确信障碍物衰减极慢，非确信障碍物正常衰减
+        int decay = cfg.map_decay_rate;
+        if (cells[i][j] > 90)
+          decay = 1; // 强记忆：确信障碍物每帧只减1，几乎不消失
+
+        cells[i][j] = std::max(0, cells[i][j] - decay);
+      }
     }
   }
 
@@ -295,9 +306,7 @@ void OccupancyGrid2D::update_with_decay(const std::vector<Obstacle> &obstacles, 
 
   for (const auto &obs : obstacles)
   {
-    // === 关键修复：灯下黑策略 ===
-    // 如果障碍物距离无人机中心过近，认为是机身本身或噪点，强制忽略
-    // 否则起飞时 A* 会认为起点被堵死
+    // 灯下黑策略
     if ((obs.position - drone_p).norm() < drone_r + 0.1)
       continue;
 
@@ -318,7 +327,7 @@ void OccupancyGrid2D::update_with_decay(const std::vector<Obstacle> &obstacles, 
         if (nx >= 0 && nx < GRID_W && ny >= 0 && ny < GRID_H)
         {
           if (dx * dx + dy * dy <= r_sq)
-            cells[nx][ny] = 100;
+            cells[nx][ny] = 100; // 观测到直接拉满
         }
       }
     }
@@ -416,7 +425,7 @@ bool run_astar(const OccupancyGrid2D &grid, Eigen::Vector2f start, Eigen::Vector
       int nx = cx + dx[i], ny = cy + dy[i];
       if (nx < 0 || nx >= OccupancyGrid2D::GRID_W || ny < 0 || ny >= OccupancyGrid2D::GRID_H)
         continue;
-      if (grid.is_occupied(nx, ny))
+      if (grid.cells[nx][ny] > 40)
         continue;
 
       int n_id = nx * OccupancyGrid2D::GRID_H + ny;
@@ -466,11 +475,14 @@ bool run_astar(const OccupancyGrid2D &grid, Eigen::Vector2f start, Eigen::Vector
 // ============================================================================
 bool is_path_blocked(const std::vector<Eigen::Vector2f> &path, const OccupancyGrid2D &grid, float check_radius)
 {
-  // 关键修复：如果路径为空（刚起飞尚未规划），返回 true 强制规划，但不打印警告
   if (path.empty())
     return true;
 
   Eigen::Vector2f drone_pos(local_pos.pose.pose.position.x, local_pos.pose.pose.position.y);
+
+  // 迟滞半径：检查当前路径时，允许比规划时更靠近障碍物一点点
+  // 这样避免因为 1-2cm 的误差导致频繁重规划
+  float hysteresis_check_dist = check_radius * 0.8f;
 
   int start_idx = 0;
   float min_dist = 1e9;
@@ -492,8 +504,10 @@ bool is_path_blocked(const std::vector<Eigen::Vector2f> &path, const OccupancyGr
     int gx, gy;
     if (grid.world_to_grid(path[i].x(), path[i].y(), gx, gy))
     {
-      // 只检测确信的障碍 (80以上)，避免被衰减中的阴影吓停
-      if (grid.cells[gx][gy] > 80)
+      // 【关键修改】
+      // 只有当栅格值 > 95 (非常确信是障碍) 时才认为路断了
+      // 之前是 > 80，现在提高阈值，让旧路径更“顽强”
+      if (grid.cells[gx][gy] > 95)
         return true;
     }
   }
