@@ -91,6 +91,8 @@ void local_livox_cb(const livox_ros_driver::CustomMsg::ConstPtr &msg)
   livox_cb_wrapper(msg);
 }
 
+void detection_cb_wrapper(const pcl_detection::ObjectDetectionResult::ConstPtr &msg);
+
 // ============================================================================
 // 可视化
 // ============================================================================
@@ -670,7 +672,7 @@ int main(int argc, char **argv)
 
   ros::Subscriber sub_state = public_nh.subscribe("mavros/state", 10, state_cb);
   ros::Subscriber sub_pos = public_nh.subscribe("/mavros/local_position/odom", 10, local_pos_cb);
-  ros::Subscriber sub_livox = public_nh.subscribe("/livox/lidar", 10, local_livox_cb);
+  ros::Subscriber sub_detection = public_nh.subscribe("/pcl_detection/result", 10, detection_cb_wrapper);
 
   pub_setpoint = public_nh.advertise<mavros_msgs::PositionTarget>("/mavros/setpoint_raw/local", 10);
   pub_viz_path_raw = public_nh.advertise<nav_msgs::Path>("/viz/raw_path", 1);

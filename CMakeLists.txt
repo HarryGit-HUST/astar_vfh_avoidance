@@ -19,6 +19,7 @@ find_package(catkin REQUIRED COMPONENTS
   livox_ros_driver
   pcl_ros             # 新增：用于点云处理
   pcl_conversions     # 新增
+  pcl_detection
 )
 
 find_package(PCL REQUIRED)

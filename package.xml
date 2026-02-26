@@ -30,4 +30,5 @@
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>mavros_msgs</exec_depend>
   
+  <depend>pcl_detection</depend>
 </package>
