@@ -526,7 +526,9 @@ private:
             if (validateAndFitObstacle(cluster, drone_position, target_position, obstacle_center, obstacle_radius))
             {
                 // 半径过滤（避免过小/过大）
-                if (obstacle_radius >= min_obstacle_radius_ && obstacle_radius <= max_obstacle_radius_)
+                if (obstacle_radius >= min_obstacle_radius_ && obstacle_radius <= max_obstacle_radius_ &&
+                    obstacle_center[0] <= drone_position[0] + 20.0f && obstacle_center[0] >= drone_position[0] - 1.5f &&
+                    std::abs(obstacle_center[1] - drone_position[1]) <= 10.0f)
                 {
                     new_detections.push_back({-1, obstacle_center, obstacle_radius, 0});
                 }

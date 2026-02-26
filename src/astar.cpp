@@ -1,16 +1,15 @@
 /**
  * @file astar.cpp
- * @brief 工程修复版：解决启动崩溃、NaN错误、起飞点死锁问题
+ * @brief 无人机避障规划 - 地图记忆增强版
  */
 #include "astar.h"
 #include <iostream>
 #include <algorithm>
 #include <cmath>
 #include <clocale>
-#include <nav_msgs/OccupancyGrid.h>
 
 // ============================================================================
-// 1. 全局变量定义 (必须与 new_detect_obs.h 中的 extern 严格对应)
+// 1. 全局变量定义
 // ============================================================================
 float target_x = 0.0f;
 float target_y = 0.0f;
@@ -22,28 +21,21 @@ float init_position_z_take_off = 0;
 float init_yaw_take_off = 0;
 bool flag_init_position = false;
 
-// ============================================================================
-// 其他全局变量
-// ============================================================================
-int mission_step = 0; // 0:Init, 1:Takeoff, 2:Avoid, 3:Land
-
 mavros_msgs::PositionTarget setpoint_raw;
 mavros_msgs::State mavros_connection_state;
 nav_msgs::Odometry local_pos;
 double current_yaw = 0.0;
 tf::Quaternion quat;
 
-// 状态记录
 float init_pos_x = 0, init_pos_y = 0, init_pos_z = 0;
 bool flag_init_pos = false;
 
-// 规划路径缓存
 std::vector<Eigen::Vector2f> global_path_raw;
 std::vector<Eigen::Vector2f> global_path_smooth;
 ros::Time last_replan_time;
 
 // ============================================================================
-// 配置参数
+// 2. 配置参数
 // ============================================================================
 struct Config
 {
@@ -56,10 +48,8 @@ struct Config
   float astar_weight;
   float replan_cooldown;
   float check_radius;
-  int map_decay_rate;
 } cfg;
 
-// ROS Publishers
 ros::Publisher pub_setpoint;
 ros::Publisher pub_viz_path_raw;
 ros::Publisher pub_viz_path_smooth;
@@ -79,34 +69,30 @@ void load_parameters(ros::NodeHandle &nh)
   nh.param<float>("planner/uav_radius", cfg.uav_radius, 0.3f);
   nh.param<float>("planner/safe_margin", cfg.safe_margin, 0.3f);
   nh.param<float>("planner/max_speed", cfg.max_speed, 0.8f);
-  nh.param<float>("planner/min_safe_dist", cfg.min_safe_dist, 0.3f);
+
   nh.param<float>("planner/lookahead_dist", cfg.lookahead_dist, 1.5f);
   nh.param<float>("planner/astar_weight", cfg.astar_weight, 1.5f);
   nh.param<float>("planner/replan_cooldown", cfg.replan_cooldown, 1.0f);
-  nh.param<int>("planner/map_decay_rate", cfg.map_decay_rate, 2);
 
   cfg.check_radius = cfg.uav_radius + 0.1f;
 
-  ROS_INFO("=== 参数加载完成 ===");
-  ROS_INFO("目标: (%.2f, %.2f), 速度: %.1f", target_x, target_y, cfg.max_speed);
+  ROS_INFO("=== 系统配置 ===");
+  ROS_INFO("Target: (%.1f, %.1f)", target_x, target_y);
+  ROS_INFO("A* Weight: %.1f", cfg.astar_weight);
 }
 
 // ============================================================================
-// 关键修复：Livox 回调代理
-// 作用：在未定位完成或未开始任务前，屏蔽雷达数据，防止 NaN 错误
+// Livox 代理回调
 // ============================================================================
 void local_livox_cb(const livox_ros_driver::CustomMsg::ConstPtr &msg)
 {
-  // 1. 如果没有初始化起飞点，绝对不能处理点云 (会导致坐标变换 NaN)
   if (!flag_init_position)
     return;
-
-  // 2. 只有在需要感知的时候才处理 (可选，这里为了安全始终运行，但上面那个判定是必须的)
   livox_cb_wrapper(msg);
 }
 
 // ============================================================================
-// 可视化函数实现 (修复 Quaternion 警告)
+// 可视化
 // ============================================================================
 void pub_viz_astar_path(const std::vector<Eigen::Vector2f> &path)
 {
@@ -119,7 +105,7 @@ void pub_viz_astar_path(const std::vector<Eigen::Vector2f> &path)
     pose.pose.position.x = pt.x();
     pose.pose.position.y = pt.y();
     pose.pose.position.z = init_pos_z + cfg.target_z;
-    pose.pose.orientation.w = 1.0; // 必须设置 w=1
+    pose.pose.orientation.w = 1.0;
     msg.poses.push_back(pose);
   }
   pub_viz_path_raw.publish(msg);
@@ -152,7 +138,7 @@ void pub_viz_smooth_path(const std::vector<Eigen::Vector2f> &path)
     mk.color.g = 0.8;
     mk.color.b = 1.0;
     mk.color.a = 0.6;
-    mk.pose.orientation.w = 1.0; // 修复警告
+    mk.pose.orientation.w = 1.0;
     ma.markers.push_back(mk);
   }
   pub_viz_path_smooth.publish(ma);
@@ -173,6 +159,7 @@ void pub_viz_vfh_vectors(float target_yaw, float selected_yaw, const Eigen::Vect
   m.scale.x = 1.0;
   m.scale.y = 0.05;
   m.scale.z = 0.05;
+  m.pose.orientation.w = 1.0;
 
   // 目标(红)
   m.color.r = 1.0;
@@ -209,7 +196,11 @@ void pub_viz_grid_map(const OccupancyGrid2D &grid)
   {
     int x = i % msg.info.width;
     int y = i / msg.info.width;
-    msg.data[i] = (grid.cells[x][y] > 50) ? 100 : 0;
+    // 归一化显示：把 0-1000 映射到 0-100
+    int val = grid.cells[x][y];
+    if (val > 100)
+      val = 100;
+    msg.data[i] = (int8_t)val;
   }
   pub_viz_map.publish(msg);
 }
@@ -246,7 +237,7 @@ std::vector<Eigen::Vector2f> BSplinePlanner::generate_smooth_path(const std::vec
 }
 
 // ============================================================================
-// 地图核心 (修复起飞点被占用问题)
+// 地图核心 (超级血条 + 三区衰减)
 // ============================================================================
 OccupancyGrid2D::OccupancyGrid2D()
 {
@@ -275,38 +266,44 @@ bool OccupancyGrid2D::is_occupied(int gx, int gy) const
 {
   if (gx < 0 || gx >= GRID_W || gy < 0 || gy >= GRID_H)
     return true;
-  return cells[gx][gy] > 50;
+  return cells[gx][gy] > OBS_THRESHOLD; // 使用 50 作为阈值
 }
 
-// 在 OccupancyGrid2D 结构体中增加一个常量
-// static const int HIGH_CONFIDENCE = 90;
-
-void OccupancyGrid2D::update_with_decay(const std::vector<Obstacle> &obstacles, float drone_r, float safe_margin)
+void OccupancyGrid2D::update_with_memory(const std::vector<Obstacle> &obstacles, float drone_r, float safe_margin)
 {
-  // 1. 动态衰减 (优化版：记忆增强)
+  Eigen::Vector2f drone_p(local_pos.pose.pose.position.x, local_pos.pose.pose.position.y);
+
+  // 1. 三区衰减逻辑
+  // Zone A: < 6m, 快速衰减 (更新眼前信息)
+  // Zone B: 6-20m, 零衰减 (记忆)
+  // Zone C: > 20m, 慢速衰减 (清理)
   for (int i = 0; i < GRID_W; ++i)
   {
     for (int j = 0; j < GRID_H; ++j)
     {
       if (cells[i][j] > 0)
       {
-        // 如果是确信的障碍物 (>90)，衰减速度减半，或者仅当 cfg.map_decay_rate 很大时才衰减
-        // 这里我们做一个保护：确信障碍物衰减极慢，非确信障碍物正常衰减
-        int decay = cfg.map_decay_rate;
-        if (cells[i][j] > 90)
-          decay = 1; // 强记忆：确信障碍物每帧只减1，几乎不消失
+        float wx, wy;
+        grid_to_world(i, j, wx, wy);
+        float dist = std::hypot(wx - drone_p.x(), wy - drone_p.y());
+
+        int decay = 0;
+        if (dist < 6.0f)
+          decay = 20; // 眼前：如果障碍物移走，快速消失
+        else if (dist > 20.0f)
+          decay = 2; // 远方：慢慢消失
+        // else: decay = 0 (6-20m 绝对记忆)
 
         cells[i][j] = std::max(0, cells[i][j] - decay);
       }
     }
   }
 
+  // 2. 观测饱和更新
   float total_r = drone_r + safe_margin;
-  Eigen::Vector2f drone_p(local_pos.pose.pose.position.x, local_pos.pose.pose.position.y);
-
   for (const auto &obs : obstacles)
   {
-    // 灯下黑策略
+    // 灯下黑策略：忽略机身附近的噪点
     if ((obs.position - drone_p).norm() < drone_r + 0.1)
       continue;
 
@@ -327,7 +324,10 @@ void OccupancyGrid2D::update_with_decay(const std::vector<Obstacle> &obstacles, 
         if (nx >= 0 && nx < GRID_W && ny >= 0 && ny < GRID_H)
         {
           if (dx * dx + dy * dy <= r_sq)
-            cells[nx][ny] = 100; // 观测到直接拉满
+          {
+            // 观测到障碍：直接加满血条
+            cells[nx][ny] = MAX_HEALTH;
+          }
         }
       }
     }
@@ -347,6 +347,7 @@ bool run_astar(const OccupancyGrid2D &grid, Eigen::Vector2f start, Eigen::Vector
     return false;
   }
 
+  // 严密性：如果起点在障碍物内（可能因为膨胀），搜索最近的空闲点
   auto find_free = [&](int &cx, int &cy) -> bool
   {
     if (!grid.is_occupied(cx, cy))
@@ -355,7 +356,7 @@ bool run_astar(const OccupancyGrid2D &grid, Eigen::Vector2f start, Eigen::Vector
     q.push({cx, cy});
     bool vis[OccupancyGrid2D::GRID_W][OccupancyGrid2D::GRID_H] = {false};
     vis[cx][cy] = true;
-    int steps = 300;
+    int steps = 500;
     while (!q.empty() && steps--)
     {
       auto cur = q.front();
@@ -380,6 +381,8 @@ bool run_astar(const OccupancyGrid2D &grid, Eigen::Vector2f start, Eigen::Vector
     return false;
   };
 
+  // 规划时使用保守逻辑：如果栅格值 > 80 (记忆很深) 就视为障碍，防止走刚衰减一点的假路
+  // 这里直接复用 is_occupied ( > 50 ) 即可，因为记忆区的衰减是 0，所以 1000 永远是 1000
   if (grid.is_occupied(sgx, sgy))
     find_free(sgx, sgy);
   if (grid.is_occupied(ggx, ggy))
@@ -400,7 +403,7 @@ bool run_astar(const OccupancyGrid2D &grid, Eigen::Vector2f start, Eigen::Vector
 
   bool found = false;
   int iter = 0;
-  while (!open.empty() && iter++ < 15000)
+  while (!open.empty() && iter++ < 20000)
   {
     auto top = open.top();
     open.pop();
@@ -425,7 +428,9 @@ bool run_astar(const OccupancyGrid2D &grid, Eigen::Vector2f start, Eigen::Vector
       int nx = cx + dx[i], ny = cy + dy[i];
       if (nx < 0 || nx >= OccupancyGrid2D::GRID_W || ny < 0 || ny >= OccupancyGrid2D::GRID_H)
         continue;
-      if (grid.cells[nx][ny] > 40)
+
+      // 规划时：严格避障
+      if (grid.is_occupied(nx, ny))
         continue;
 
       int n_id = nx * OccupancyGrid2D::GRID_H + ny;
@@ -471,7 +476,7 @@ bool run_astar(const OccupancyGrid2D &grid, Eigen::Vector2f start, Eigen::Vector
 }
 
 // ============================================================================
-// 增量检测 (修复：空路径处理)
+// 增量检测 (使用双重阈值 + 迟滞逻辑)
 // ============================================================================
 bool is_path_blocked(const std::vector<Eigen::Vector2f> &path, const OccupancyGrid2D &grid, float check_radius)
 {
@@ -479,10 +484,6 @@ bool is_path_blocked(const std::vector<Eigen::Vector2f> &path, const OccupancyGr
     return true;
 
   Eigen::Vector2f drone_pos(local_pos.pose.pose.position.x, local_pos.pose.pose.position.y);
-
-  // 迟滞半径：检查当前路径时，允许比规划时更靠近障碍物一点点
-  // 这样避免因为 1-2cm 的误差导致频繁重规划
-  float hysteresis_check_dist = check_radius * 0.8f;
 
   int start_idx = 0;
   float min_dist = 1e9;
@@ -504,10 +505,10 @@ bool is_path_blocked(const std::vector<Eigen::Vector2f> &path, const OccupancyGr
     int gx, gy;
     if (grid.world_to_grid(path[i].x(), path[i].y(), gx, gy))
     {
-      // 【关键修改】
-      // 只有当栅格值 > 95 (非常确信是障碍) 时才认为路断了
-      // 之前是 > 80，现在提高阈值，让旧路径更“顽强”
-      if (grid.cells[gx][gy] > 95)
+      // 迟滞检测：
+      // 只有当障碍物非常确信 (> 900, 即满血状态) 时才认为路被堵死
+      // 这允许无人机穿过一些边缘的、正在衰减的噪点，避免过度敏感
+      if (grid.cells[gx][gy] > 900)
         return true;
     }
   }
@@ -669,7 +670,6 @@ int main(int argc, char **argv)
 
   ros::Subscriber sub_state = public_nh.subscribe("mavros/state", 10, state_cb);
   ros::Subscriber sub_pos = public_nh.subscribe("/mavros/local_position/odom", 10, local_pos_cb);
-  // 使用代理回调
   ros::Subscriber sub_livox = public_nh.subscribe("/livox/lidar", 10, local_livox_cb);
 
   pub_setpoint = public_nh.advertise<mavros_msgs::PositionTarget>("/mavros/setpoint_raw/local", 10);
@@ -714,6 +714,7 @@ int main(int argc, char **argv)
   bool has_global_plan = false;
   ros::Time last_req = ros::Time::now();
 
+  // 全局地图实例 (必须持久化，不能在循环里创建)
   OccupancyGrid2D global_grid;
 
   while (ros::ok())
@@ -761,8 +762,8 @@ int main(int argc, char **argv)
       setpoint_raw.position.x = init_pos_x;
       setpoint_raw.position.y = init_pos_y;
 
-      // 清理起飞点的地图障碍 (防止 A* 以为在墙里)
-      global_grid.update_with_decay(obstacles, cfg.uav_radius, cfg.safe_margin);
+      // 起飞阶段也更新地图 (建立初始记忆)
+      global_grid.update_with_memory(obstacles, cfg.uav_radius, cfg.safe_margin);
 
       if (std::abs(local_pos.pose.pose.position.z - target_abs_z) < 0.2)
       {
@@ -777,20 +778,18 @@ int main(int argc, char **argv)
       Eigen::Vector2f curr(local_pos.pose.pose.position.x, local_pos.pose.pose.position.y);
       Eigen::Vector2f goal(init_pos_x + target_x, init_pos_y + target_y);
 
-      // 1. 更新全局地图 (带衰减)
-      global_grid.update_with_decay(obstacles, cfg.uav_radius, cfg.safe_margin);
+      // 1. 更新地图 (三区衰减 + 超级血条)
+      global_grid.update_with_memory(obstacles, cfg.uav_radius, cfg.safe_margin);
 
       static int cnt = 0;
       if (cnt++ % 5 == 0)
         pub_viz_grid_map(global_grid);
 
-      // 2. 增量检查
+      // 2. 增量检查 (迟滞)
       bool blocked = is_path_blocked(global_path_smooth, global_grid, 0.0f);
       bool cooldown_over = (ros::Time::now() - last_replan_time).toSec() > cfg.replan_cooldown;
 
       // 3. 重规划决策
-      // 注意：如果 blocked 为 true，这里会打印 WARN (is_path_blocked 内部不打印，留给这里)
-      // 仅当路径真的存在且被堵，或者根本没路径时，才规划
       if (!has_global_plan || (blocked && cooldown_over))
       {
         if (blocked && has_global_plan)
