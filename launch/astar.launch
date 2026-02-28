@@ -1,7 +1,7 @@
 <launch>
     <!-- 1. 启动感知节点 (眼睛) -->
     <!-- 包含 pcl_detection 的启动文件 -->
-    <include file="$(find pcl_detection)/launch/object_detector.launch" />
+   <!-- <include file="$(find pcl_detection)/launch/object_detector.launch" />-->
 
     <!-- 2. 启动规划节点 (大脑) -->
     <node pkg="astar" type="astar" name="astar_node" output="screen">
@@ -9,5 +9,5 @@
     </node>
     
     <!-- 3. 启动 RViz -->
-    <node pkg="rviz" type="rviz" name="rviz" args="-d $(find astar)/config/planner.rviz" launch-prefix="bash -c 'sleep 5; $0 $@' " />
+    <!--<node pkg="rviz" type="rviz" name="rviz" args="-d $(find astar)/config/planner.rviz" launch-prefix="bash -c 'sleep 5; $0 $@' " />-->
 </launch>

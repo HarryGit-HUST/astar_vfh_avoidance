@@ -1,15 +1,15 @@
 target_x: 6.0
 target_y: 0.0
-target_z: 0.0
-
 debug_mode: true
 
 planner:
+  takeoff_height: 1.2    # 起飞和巡航高度
   uav_radius: 0.3
-  safe_margin: 0.2
-  max_speed: 1.0
+  safe_margin: 0.3
+  max_speed: 0.8
   min_safe_dist: 0.3
   
-  corridor_width: 1.2
+  lookahead_dist: 1.5
+  astar_weight: 1.5
   replan_cooldown: 1.5
-  enable_corridor: true
+  map_decay_rate: 2      # 衰减慢一点，保持记忆
