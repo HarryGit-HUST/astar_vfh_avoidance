@@ -3,7 +3,7 @@ target_y: 0.0
 debug_mode: true
 
 planner:
-  takeoff_height: 1.2    # 起飞和巡航高度
+  takeoff_height: 0.7    # 起飞和巡航高度
   uav_radius: 0.3
   safe_margin: 0.3
   max_speed: 0.8
@@ -12,4 +12,4 @@ planner:
   lookahead_dist: 1.5
   astar_weight: 1.5
   replan_cooldown: 1.5
-  map_decay_rate: 2      # 衰减慢一点，保持记忆
+  map_decay_rate: 8      # 衰减慢一点，保持记忆

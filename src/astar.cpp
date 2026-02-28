@@ -1,6 +1,6 @@
 /**
  * @file astar.cpp
- * @brief 修复版：增加坐标系转换，解决“障碍物看不见”的问题
+ * @brief 调试专用修复版：增加详细日志，解除起飞前地图锁定
  */
 #include "astar.h"
 #include <iostream>
@@ -88,107 +88,136 @@ void load_parameters(ros::NodeHandle &nh)
 }
 
 // ============================================================================
-// PCL 障碍物回调 (核心修复：增加坐标变换)
+// PCL 障碍物回调 (核心调试区)
 // ============================================================================
 void detection_cb_wrapper(const pcl_detection::ObjectDetectionResult::ConstPtr &msg)
 {
+  // 如果没有定位，无法转换坐标，直接返回
   if (!flag_init_position)
+  {
+    ROS_WARN_THROTTLE(2.0, "[感知] 等待无人机定位初始化 (flag_init_position=false)...");
     return;
+  }
 
-  // 只有在避障阶段才更新，防止起飞阶段地面干扰
-  // 修改：允许在 mission_step >= 1 (起飞后) 就开始感知，以便观察
-  if (mission_step < 1)
-    return;
+  // 【修改点 1】不再限制 mission_step，只要有定位就处理，方便地面调试
+  // if (mission_step < 2) return;
 
   obstacles.clear();
   int obs_id = 0;
 
-  // 获取无人机当前世界坐标和朝向
+  // 获取飞机坐标
   float drone_wx = local_pos.pose.pose.position.x;
   float drone_wy = local_pos.pose.pose.position.y;
-  float drone_yaw = current_yaw; // 由 local_pos_cb 更新
+  float drone_yaw = current_yaw;
 
-  // 预计算旋转矩阵
   float cos_yaw = cos(drone_yaw);
   float sin_yaw = sin(drone_yaw);
 
+  // 【调试信息】打印当前收到的原始数据量
+  if (if_debug > 0.5)
+  {
+    ROS_INFO_THROTTLE(1.0, "[感知] 收到 PCL 消息: %lu 个物体. 飞机位置: (%.2f, %.2f) Yaw: %.2f",
+                      msg->objects.size(), drone_wx, drone_wy, drone_yaw);
+  }
+
   for (const auto &obj : msg->objects)
   {
+    // 1. 数据有效性检查
     if (!std::isfinite(obj.position.x) || !std::isfinite(obj.position.y))
+    {
+      ROS_WARN("[感知] 忽略无效坐标: (%.2f, %.2f)", obj.position.x, obj.position.y);
       continue;
+    }
 
-    // === 坐标变换核心 ===
-    // 假设 pcl_detection 输出的是相对于雷达/机身的坐标 (Body Frame)
-    // X_body = 前, Y_body = 左
+    // 2. 坐标转换 (Body -> World)
+    // 假设 obj.position 是相对于雷达的坐标
     float rel_x = obj.position.x;
     float rel_y = obj.position.y;
 
-    // 旋转 + 平移 -> 世界坐标
     float abs_x = drone_wx + rel_x * cos_yaw - rel_y * sin_yaw;
     float abs_y = drone_wy + rel_x * sin_yaw + rel_y * cos_yaw;
 
-    // 调试日志：打印前几个障碍物的坐标变换结果
-    if (if_debug > 0.5 && obs_id == 0)
+    float dist_rel = std::hypot(rel_x, rel_y);
+
+    // 【调试信息】打印每一个物体的转换详情
+    if (if_debug > 0.5)
     {
-      ROS_INFO_THROTTLE(1.0, "[感知] 机身:(%.1f, %.1f) | 相对:(%.1f, %.1f) -> 绝对:(%.1f, %.1f)",
-                        drone_wx, drone_wy, rel_x, rel_y, abs_x, abs_y);
+      ROS_INFO_THROTTLE(0.5, "  -> Obj[%d] Type:%d R:%.2f 相对:(%.2f, %.2f) 绝对:(%.2f, %.2f)",
+                        obs_id, obj.type, obj.radius, rel_x, rel_y, abs_x, abs_y);
     }
 
-    // 距离过滤 (基于相对距离)
-    float dist_rel = std::hypot(rel_x, rel_y);
+    // 3. 过滤逻辑 (必须严格检查这里是否误杀了障碍物)
     if (dist_rel > 10.0f)
+    {
+      // ROS_INFO("     [过滤] 太远");
       continue;
-    if (dist_rel < 0.5f)
-      continue; // 过滤自身
+    }
+    if (dist_rel < 0.3f)
+    { // 稍微放宽一点，0.5可能把近处障碍过滤了
+      // ROS_INFO("     [过滤] 太近(自身)");
+      continue;
+    }
 
-    // 1. 圆柱/圆
+    // === 1. 圆柱体 / 圆环 ===
+    // 检查你的 PCL 代码，CYLINDER 的 type 是不是 1
     if (obj.type == 1 || obj.type == 2)
     {
       if (obj.radius > 3.0f)
-        continue; // 过滤错误的大平面
+        continue;
 
       Obstacle obs;
       obs.id = obs_id++;
       obs.type = CYLINDER;
-      obs.position = Eigen::Vector2f(abs_x, abs_y); // 使用绝对坐标
+      obs.position = Eigen::Vector2f(abs_x, abs_y);
       obs.radius = obj.radius;
       obs.length = 0;
       obs.angle = 0;
       obstacles.push_back(obs);
     }
-    // 2. 墙体
+    // === 2. 墙体 ===
+    // 检查你的 PCL 代码，WALL 的 type 是不是 0
     else if (obj.type == 0)
     {
       if (obj.plane_coeffs.size() < 4)
+      {
+        ROS_WARN("     [错误] 墙体缺少平面参数");
         continue;
+      }
 
-      // 法向量也是相对坐标系下的，需要旋转到世界坐标系
-      double nx_rel = obj.plane_coeffs[0];
-      double ny_rel = obj.plane_coeffs[1];
-      double norm = std::sqrt(nx_rel * nx_rel + ny_rel * ny_rel);
+      double nx = obj.plane_coeffs[0];
+      double ny = obj.plane_coeffs[1];
+      double norm = std::sqrt(nx * nx + ny * ny);
       if (norm < 1e-3)
         continue;
-      nx_rel /= norm;
-      ny_rel /= norm;
+      nx /= norm;
+      ny /= norm;
 
-      // 旋转法向量
-      double nx_world = nx_rel * cos_yaw - ny_rel * sin_yaw;
-      double ny_world = nx_rel * sin_yaw + ny_rel * cos_yaw;
+      // 旋转法向量到世界系
+      double nx_world = nx * cos_yaw - ny * sin_yaw;
+      double ny_world = nx * sin_yaw + ny * cos_yaw;
 
-      // 切向量 (-ny, nx)
       double tx = -ny_world;
       double ty = nx_world;
 
       Obstacle obs;
       obs.id = obs_id++;
       obs.type = WALL;
-      obs.position = Eigen::Vector2f(abs_x, abs_y); // 使用绝对坐标
+      obs.position = Eigen::Vector2f(abs_x, abs_y);
       obs.radius = 0.05f;
       obs.length = obj.width;
       obs.angle = std::atan2(ty, tx);
 
       obstacles.push_back(obs);
     }
+    else
+    {
+      ROS_WARN("     [未知类型] Type: %d", obj.type);
+    }
+  }
+
+  if (if_debug > 0.5)
+  {
+    ROS_INFO_THROTTLE(1.0, "[感知] 最终存入障碍物列表: %lu 个", obstacles.size());
   }
 }
 
@@ -249,7 +278,7 @@ void OccupancyGrid2D::update_with_memory(const std::vector<Obstacle> &obstacles,
 {
   Eigen::Vector2f drone_p(local_pos.pose.pose.position.x, local_pos.pose.pose.position.y);
 
-  // 1. 三区衰减
+  // 1. 衰减
   for (int i = 0; i < GRID_W; ++i)
   {
     for (int j = 0; j < GRID_H; ++j)
@@ -261,7 +290,7 @@ void OccupancyGrid2D::update_with_memory(const std::vector<Obstacle> &obstacles,
         float dist = std::hypot(wx - drone_p.x(), wy - drone_p.y());
         int decay = 0;
         if (dist < 6.0f)
-          decay = 20;
+          decay = 10; // 加快近处衰减，看看是否是残影问题
         else if (dist > 20.0f)
           decay = 2;
         cells[i][j] = std::max(0, cells[i][j] - decay);
@@ -271,17 +300,20 @@ void OccupancyGrid2D::update_with_memory(const std::vector<Obstacle> &obstacles,
 
   float total_margin = drone_r + safe_margin;
 
+  // 【调试】
+  // if (obstacles.size() > 0 && if_debug > 0.5) ROS_INFO_THROTTLE(1.0, "[地图] 正在将 %lu 个障碍物写入栅格", obstacles.size());
+
   for (const auto &obs : obstacles)
   {
-    // 这里的 obs.position 已经是绝对坐标了
-    if ((obs.position - drone_p).norm() < 0.6f)
-      continue;
-
+    // 1. 圆柱体
     if (obs.type == CYLINDER)
     {
       int gx, gy;
       if (!world_to_grid(obs.position.x(), obs.position.y(), gx, gy))
+      {
+        // ROS_WARN("[地图] 圆柱在地图外: (%.1f, %.1f)", obs.position.x(), obs.position.y());
         continue;
+      }
 
       float effect_r = obs.radius + total_margin;
       int r_cells = std::ceil(effect_r / resolution);
@@ -301,6 +333,7 @@ void OccupancyGrid2D::update_with_memory(const std::vector<Obstacle> &obstacles,
         }
       }
     }
+    // 2. 墙体
     else if (obs.type == WALL)
     {
       float half_len = obs.length / 2.0f;
@@ -340,6 +373,7 @@ void OccupancyGrid2D::update_with_memory(const std::vector<Obstacle> &obstacles,
           float wx, wy;
           grid_to_world(x, y, wx, wy);
           Eigen::Vector2f grid_pt(wx, wy);
+
           if (dist_sq_point_to_segment(grid_pt, p1, p2) <= exp_sq)
           {
             cells[x][y] = MAX_HEALTH;
@@ -420,6 +454,7 @@ void pub_viz_vfh_vectors(float target_yaw, float selected_yaw, const Eigen::Vect
   m.scale.z = 0.05;
   m.pose.orientation.w = 1.0;
 
+  // 目标(红)
   m.color.r = 1.0;
   m.color.g = 0.0;
   m.color.b = 0.0;
@@ -427,6 +462,7 @@ void pub_viz_vfh_vectors(float target_yaw, float selected_yaw, const Eigen::Vect
   tf::quaternionTFToMsg(tf::createQuaternionFromYaw(target_yaw), m.pose.orientation);
   pub_viz_vfh.publish(m);
 
+  // 选择(绿)
   m.id = 1;
   m.color.r = 0.0;
   m.color.g = 1.0;
@@ -862,8 +898,6 @@ int main(int argc, char **argv)
       setpoint_raw.position.z = target_abs_z;
       setpoint_raw.position.x = init_pos_x;
       setpoint_raw.position.y = init_pos_y;
-
-      // 起飞阶段开启地图更新，但不用于避障，只用于建立初始记忆
       global_grid.update_with_memory(obstacles, cfg.uav_radius, cfg.safe_margin);
 
       if (std::abs(local_pos.pose.pose.position.z - target_abs_z) < 0.2)
