@@ -35,7 +35,8 @@ include_directories(
 )
 
 ## 链接 PCL 和 Catkin 库
-add_executable(astar src/astar.cpp)
+add_executable(astar src/astar.cpp
+src/ring_crossing.cpp)
 target_link_libraries(astar 
   ${catkin_LIBRARIES}
   ${PCL_LIBRARIES} 
