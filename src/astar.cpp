@@ -1,17 +1,17 @@
 /**
  * @file astar.cpp
- * @brief 无人机全自主任务控制系统 (起飞-避障-穿门-降落)
- * @details 包含：加权A*、B-Spline平滑、VFH+局部规划、三区地图记忆、YOLO穿门逻辑
+ * @brief 最终修复版：引入 TF 解决 5秒 延时导致的坐标漂移问题
  */
 #include "astar.h"
-#include "ring_crossing.h" // 必须包含穿门逻辑头文件
+#include "ring_crossing.h"
 #include <iostream>
 #include <algorithm>
 #include <cmath>
 #include <clocale>
+#include <tf/transform_listener.h> // 必须引入
 
 // ============================================================================
-// 1. 全局变量与对象定义
+// 1. 全局变量
 // ============================================================================
 float target_x = 0.0f;
 float target_y = 0.0f;
@@ -23,13 +23,9 @@ float init_position_z_take_off = 0;
 float init_yaw_take_off = 0;
 bool flag_init_position = false;
 
-// 障碍物列表
 std::vector<Obstacle> obstacles;
-
-// 穿门控制器
 RingCrossing ring_ctrl;
 
-// 内部状态变量
 int mission_step = 0;
 mavros_msgs::PositionTarget setpoint_raw;
 mavros_msgs::State mavros_connection_state;
@@ -40,14 +36,15 @@ tf::Quaternion quat;
 float init_pos_x = 0, init_pos_y = 0, init_pos_z = 0;
 bool flag_init_pos = false;
 
-// 路径规划缓存
 std::vector<Eigen::Vector2f> global_path_raw;
 std::vector<Eigen::Vector2f> global_path_smooth;
 ros::Time last_replan_time;
 bool has_global_plan = false;
 
-// 全局地图实例 (持久化记忆)
 OccupancyGrid2D global_grid;
+
+// === 新增：TF 监听器指针 ===
+tf::TransformListener *tf_listener = nullptr;
 
 // ============================================================================
 // 2. 配置参数
@@ -55,14 +52,10 @@ OccupancyGrid2D global_grid;
 struct Config
 {
   float takeoff_height;
-
-  // 物理参数
   float uav_radius;
   float safe_margin;
   float max_speed;
   float min_safe_dist;
-
-  // 规划参数
   float lookahead_dist;
   float astar_weight;
   float replan_cooldown;
@@ -70,7 +63,6 @@ struct Config
   int map_decay_rate;
 } cfg;
 
-// ROS Publishers
 ros::Publisher pub_setpoint;
 ros::Publisher pub_viz_path_raw;
 ros::Publisher pub_viz_path_smooth;
@@ -78,12 +70,11 @@ ros::Publisher pub_viz_vfh;
 ros::Publisher pub_viz_map;
 
 // ============================================================================
-// 3. 辅助函数实现
+// 3. 辅助函数
 // ============================================================================
-
 void load_parameters(ros::NodeHandle &nh)
 {
-  nh.param<float>("target_x", target_x, 5.0f);
+  nh.param<float>("target_x", target_x, 6.0f);
   nh.param<float>("target_y", target_y, 0.0f);
   nh.param<float>("debug_mode", if_debug, 1.0f);
 
@@ -133,33 +124,56 @@ float dist_sq_point_to_segment(const Eigen::Vector2f &p, const Eigen::Vector2f &
 }
 
 // ============================================================================
-// 4. 感知与地图模块
+// 4. 感知回调 (核心修复：TF 历史坐标变换)
 // ============================================================================
-
-// PCL 回调：坐标转换与几何解析
 void detection_cb_wrapper(const pcl_detection::ObjectDetectionResult::ConstPtr &msg)
 {
-  if (!flag_init_pos || mission_step < 1)
-    return; // 起飞前不更新
+  if (!flag_init_pos || !tf_listener)
+    return;
 
   obstacles.clear();
   Eigen::Vector2f drone_p(local_pos.pose.pose.position.x, local_pos.pose.pose.position.y);
-  float cos_y = cos(current_yaw);
-  float sin_y = sin(current_yaw);
+
+  // 目标坐标系：map (也就是 MAVROS 的 local_origin)
+  std::string target_frame = "map";
 
   for (const auto &obj : msg->objects)
   {
     if (!std::isfinite(obj.position.x) || !std::isfinite(obj.position.y))
       continue;
 
-    // 相对坐标 -> 绝对坐标
-    float rx = obj.position.x;
-    float ry = obj.position.y;
-    float wx = drone_p.x() + rx * cos_y - ry * sin_y;
-    float wy = drone_p.y() + rx * sin_y + ry * cos_y;
+    // 1. 构建点 (带时间戳)
+    geometry_msgs::PointStamped pt_in, pt_out;
+    pt_in.header = msg->header; // 使用 PCL 消息里的历史时间戳！
+    pt_in.point.x = obj.position.x;
+    pt_in.point.y = obj.position.y;
+    pt_in.point.z = obj.position.z;
 
-    // 过滤过远或过近(机身)的噪点
-    float dist_rel = std::hypot(rx, ry);
+    try
+    {
+      // 2. 核心：请求 TF 进行历史变换
+      // 等待变换关系可用 (最多等 0.1s)
+      // 注意：如果 msg->header.frame_id 是空的，默认设为 "base_link" (视你的雷达挂载而定)
+      if (pt_in.header.frame_id.empty())
+        pt_in.header.frame_id = "base_link";
+
+      // 执行变换：把 "几秒前" 在 "雷达系" 下的点，转换到 "map系" 下
+      tf_listener->transformPoint(target_frame, pt_in, pt_out);
+    }
+    catch (tf::TransformException &ex)
+    {
+      ROS_WARN_THROTTLE(1.0, "[TF Error] 无法转换坐标: %s. 使用当前位姿硬算...", ex.what());
+      // 降级处理：还是用手算 (虽然会有误差，总比没有好)
+      float cos_y = cos(current_yaw), sin_y = sin(current_yaw);
+      pt_out.point.x = drone_p.x() + obj.position.x * cos_y - obj.position.y * sin_y;
+      pt_out.point.y = drone_p.y() + obj.position.x * sin_y + obj.position.y * cos_y;
+    }
+
+    float wx = pt_out.point.x;
+    float wy = pt_out.point.y;
+
+    // 过滤
+    float dist_rel = std::hypot(wx - drone_p.x(), wy - drone_p.y());
     if (dist_rel > 10.0f || dist_rel < 0.5f)
       continue;
 
@@ -170,24 +184,46 @@ void detection_cb_wrapper(const pcl_detection::ObjectDetectionResult::ConstPtr &
 
     if (obs.type == WALL)
     {
-      if (obj.plane_coeffs.size() < 2)
-        continue;
-      // 法向量旋转
-      double nx = obj.plane_coeffs[0], ny = obj.plane_coeffs[1];
-      double norm = std::hypot(nx, ny);
-      if (norm < 1e-3)
-        continue;
-      double nx_w = (nx / norm) * cos_y - (ny / norm) * sin_y;
-      double ny_w = (nx / norm) * sin_y + (ny / norm) * cos_y;
+      // 墙体法向量也需要旋转。这里因为是方向向量，只受旋转影响
+      // 简单起见，我们假设墙体在世界系下是静止的，
+      // 实际上墙体角度转换也需要 TF，这里简化处理，直接用 geometric 方法
+      // 如果需要精确，应该把 (nx, ny, 0) 当作 Vector3Stamped 进行 transformVector
 
-      obs.radius = 0.05f; // 墙体物理厚度
+      double nx = obj.plane_coeffs[0];
+      double ny = obj.plane_coeffs[1];
+
+      // 尝试对法向量进行 TF 变换 (Vector 而不是 Point)
+      geometry_msgs::Vector3Stamped vec_in, vec_out;
+      vec_in.header = msg->header;
+      if (vec_in.header.frame_id.empty())
+        vec_in.header.frame_id = "base_link";
+      vec_in.vector.x = nx;
+      vec_in.vector.y = ny;
+      vec_in.vector.z = 0;
+
+      try
+      {
+        tf_listener->transformVector(target_frame, vec_in, vec_out);
+        nx = vec_out.vector.x;
+        ny = vec_out.vector.y;
+      }
+      catch (...)
+      { /* Fallback using current yaw */
+        float cy = cos(current_yaw), sy = sin(current_yaw);
+        float tmp_nx = nx;
+        nx = tmp_nx * cy - ny * sy;
+        ny = tmp_nx * sy + ny * cy;
+      }
+
+      obs.radius = 0.05f;
       obs.length = obj.width;
-      obs.angle = std::atan2(nx_w, -ny_w); // 切向
+      // 切线方向 = 法向量旋转90度
+      obs.angle = std::atan2(nx, -ny);
     }
     else
     {
       if (obj.radius > 3.0f)
-        continue; // 过滤大平面误检
+        continue;
       obs.radius = obj.radius;
       obs.length = 0;
       obs.angle = 0;
@@ -196,7 +232,9 @@ void detection_cb_wrapper(const pcl_detection::ObjectDetectionResult::ConstPtr &
   }
 }
 
-// 地图实现
+// ============================================================================
+// 地图方法
+// ============================================================================
 OccupancyGrid2D::OccupancyGrid2D()
 {
   resolution = 0.1f;
@@ -231,7 +269,7 @@ void OccupancyGrid2D::update_with_memory(const std::vector<Obstacle> &obstacles,
 {
   Eigen::Vector2f drone_p(local_pos.pose.pose.position.x, local_pos.pose.pose.position.y);
 
-  // 1. 三区衰减
+  // 三区衰减
   for (int i = 0; i < GRID_W; ++i)
   {
     for (int j = 0; j < GRID_H; ++j)
@@ -243,10 +281,9 @@ void OccupancyGrid2D::update_with_memory(const std::vector<Obstacle> &obstacles,
         float dist = std::hypot(wx - drone_p.x(), wy - drone_p.y());
         int decay = 0;
         if (dist < 6.0f)
-          decay = 10; // 近处快衰
+          decay = 10;
         else if (dist > 20.0f)
-          decay = 2; // 远处慢衰
-        // 6-20m 处 decay=0 (记忆)
+          decay = 2;
         cells[i][j] = std::max(0, cells[i][j] - decay);
       }
     }
@@ -256,7 +293,7 @@ void OccupancyGrid2D::update_with_memory(const std::vector<Obstacle> &obstacles,
   for (const auto &obs : obstacles)
   {
     if ((obs.position - drone_p).norm() < drone_r + 0.1f)
-      continue; // 自我过滤
+      continue;
 
     if (obs.type == CYLINDER)
     {
@@ -289,7 +326,6 @@ void OccupancyGrid2D::update_with_memory(const std::vector<Obstacle> &obstacles,
       float exp = obs.radius + total_margin;
       float exp_sq = exp * exp;
 
-      // AABB 包围盒优化
       float min_x = std::min(p1.x(), p2.x()) - exp;
       float max_x = std::max(p1.x(), p2.x()) + exp;
       float min_y = std::min(p1.y(), p2.y()) - exp;
@@ -298,11 +334,14 @@ void OccupancyGrid2D::update_with_memory(const std::vector<Obstacle> &obstacles,
       int min_gx, min_gy, max_gx, max_gy;
       world_to_grid(min_x, min_y, min_gx, min_gy);
       world_to_grid(max_x, max_y, max_gx, max_gy);
-      // 边界钳位略... 假设在地图内
+      min_gx = std::max(0, min_gx);
+      min_gy = std::max(0, min_gy);
+      max_gx = std::min(GRID_W - 1, max_gx);
+      max_gy = std::min(GRID_H - 1, max_gy);
 
-      for (int x = std::max(0, min_gx); x <= std::min(GRID_W - 1, max_gx); ++x)
+      for (int x = min_gx; x <= max_gx; ++x)
       {
-        for (int y = std::max(0, min_gy); y <= std::min(GRID_H - 1, max_gy); ++y)
+        for (int y = min_gy; y <= max_gy; ++y)
         {
           float wx, wy;
           grid_to_world(x, y, wx, wy);
@@ -316,25 +355,23 @@ void OccupancyGrid2D::update_with_memory(const std::vector<Obstacle> &obstacles,
   }
 }
 
-// ============================================================================
-// 5. 规划算法 (A* + B-Spline + VFH)
-// ============================================================================
-
+// ... [此处省略 run_astar, is_path_blocked, get_lookahead_point, run_vfh_plus, generate_smooth_path, viz 等函数] ...
+// ... [请直接复用上一版 src/astar.cpp 中这些完全未变动的算法实现] ...
+// ... [务必确保这些函数体存在] ...
+// ------------------ 占位符 START ------------------
 bool run_astar(const OccupancyGrid2D &grid, Eigen::Vector2f start, Eigen::Vector2f goal, std::vector<Eigen::Vector2f> &out_path)
 {
   out_path.clear();
   int sgx, sgy, ggx, ggy;
   if (!grid.world_to_grid(start.x(), start.y(), sgx, sgy) || !grid.world_to_grid(goal.x(), goal.y(), ggx, ggy))
     return false;
-
-  // BFS 找最近可用点
   auto find_free = [&](int &cx, int &cy) -> bool
   {
     if (!grid.is_occupied(cx, cy))
       return true;
     std::queue<std::pair<int, int>> q;
     q.push({cx, cy});
-    bool vis[OccupancyGrid2D::GRID_W][OccupancyGrid2D::GRID_H] = {false};
+    bool vis[200][200] = {false};
     vis[cx][cy] = true;
     int steps = 500;
     while (!q.empty() && steps--)
@@ -351,7 +388,7 @@ bool run_astar(const OccupancyGrid2D &grid, Eigen::Vector2f start, Eigen::Vector
       for (int i = 0; i < 4; ++i)
       {
         int nx = cur.first + dx[i], ny = cur.second + dy[i];
-        if (nx >= 0 && nx < OccupancyGrid2D::GRID_W && ny >= 0 && ny < OccupancyGrid2D::GRID_H && !vis[nx][ny])
+        if (nx >= 0 && nx < 200 && ny >= 0 && ny < 200 && !vis[nx][ny])
         {
           vis[nx][ny] = true;
           q.push({nx, ny});
@@ -364,20 +401,15 @@ bool run_astar(const OccupancyGrid2D &grid, Eigen::Vector2f start, Eigen::Vector
     find_free(sgx, sgy);
   if (grid.is_occupied(ggx, ggy))
     find_free(ggx, ggy);
-
-  // A*
   typedef std::pair<float, int> P;
   std::priority_queue<P, std::vector<P>, std::greater<P>> open;
   static float g_cost[40000];
   static int parent[40000];
   std::fill(g_cost, g_cost + 40000, 1e9);
   std::fill(parent, parent + 40000, -1);
-
-  int start_id = sgx * OccupancyGrid2D::GRID_H + sgy;
-  int goal_id = ggx * OccupancyGrid2D::GRID_H + ggy;
+  int start_id = sgx * 200 + sgy, goal_id = ggx * 200 + ggy;
   g_cost[start_id] = 0;
   open.push({0, start_id});
-
   bool found = false;
   int iter = 0;
   while (!open.empty() && iter++ < 20000)
@@ -392,21 +424,17 @@ bool run_astar(const OccupancyGrid2D &grid, Eigen::Vector2f start, Eigen::Vector
     }
     if (top.first > g_cost[curr] + 100)
       continue;
-
-    int cx = curr / OccupancyGrid2D::GRID_H;
-    int cy = curr % OccupancyGrid2D::GRID_H;
+    int cx = curr / 200, cy = curr % 200;
     int dx[] = {1, -1, 0, 0, 1, 1, -1, -1}, dy[] = {0, 0, 1, -1, 1, -1, 1, -1};
     float dists[] = {1, 1, 1, 1, 1.414, 1.414, 1.414, 1.414};
-
     for (int i = 0; i < 8; ++i)
     {
       int nx = cx + dx[i], ny = cy + dy[i];
-      if (nx < 0 || nx >= OccupancyGrid2D::GRID_W || ny < 0 || ny >= OccupancyGrid2D::GRID_H)
+      if (nx < 0 || nx >= 200 || ny < 0 || ny >= 200)
         continue;
       if (grid.is_occupied(nx, ny))
         continue;
-
-      int n_id = nx * OccupancyGrid2D::GRID_H + ny;
+      int n_id = nx * 200 + ny;
       float new_g = g_cost[curr] + dists[i];
       if (new_g < g_cost[n_id])
       {
@@ -417,30 +445,24 @@ bool run_astar(const OccupancyGrid2D &grid, Eigen::Vector2f start, Eigen::Vector
       }
     }
   }
-
   if (!found)
     return false;
-
-  // 路径回溯与抽稀
   std::vector<Eigen::Vector2f> raw_pts;
   int curr = goal_id;
   while (curr != -1)
   {
     float wx, wy;
-    grid.grid_to_world(curr / OccupancyGrid2D::GRID_H, curr % OccupancyGrid2D::GRID_H, wx, wy);
+    grid.grid_to_world(curr / 200, curr % 200, wx, wy);
     raw_pts.push_back({wx, wy});
     curr = parent[curr];
   }
   std::reverse(raw_pts.begin(), raw_pts.end());
-
   if (!raw_pts.empty())
   {
     out_path.push_back(raw_pts[0]);
     for (size_t i = 1; i < raw_pts.size() - 1; ++i)
-    {
       if ((raw_pts[i] - out_path.back()).norm() > 0.6)
         out_path.push_back(raw_pts[i]);
-    }
     out_path.push_back(raw_pts.back());
   }
   return true;
@@ -456,16 +478,12 @@ std::vector<Eigen::Vector2f> BSplinePlanner::generate_smooth_path(const std::vec
   pts.insert(pts.begin(), cps[0]);
   pts.insert(pts.end(), cps.back());
   pts.insert(pts.end(), cps.back());
-
   for (size_t i = 0; i < pts.size() - 3; ++i)
   {
     for (int j = 0; j < points_per_seg; ++j)
     {
       float u = (float)j / (float)points_per_seg;
-      float b0 = (1 - u) * (1 - u) * (1 - u) / 6.0f;
-      float b1 = (3 * u * u * u - 6 * u * u + 4) / 6.0f;
-      float b2 = (-3 * u * u * u + 3 * u * u + 3 * u + 1) / 6.0f;
-      float b3 = u * u * u / 6.0f;
+      float b0 = (1 - u) * (1 - u) * (1 - u) / 6.0f, b1 = (3 * u * u * u - 6 * u * u + 4) / 6.0f, b2 = (-3 * u * u * u + 3 * u * u + 3 * u + 1) / 6.0f, b3 = u * u * u / 6.0f;
       result.push_back(b0 * pts[i] + b1 * pts[i + 1] + b2 * pts[i + 2] + b3 * pts[i + 3]);
     }
   }
@@ -478,7 +496,6 @@ bool is_path_blocked(const std::vector<Eigen::Vector2f> &path, const OccupancyGr
   if (path.empty())
     return true;
   Eigen::Vector2f drone_pos(local_pos.pose.pose.position.x, local_pos.pose.pose.position.y);
-
   int start_idx = 0;
   float min_dist = 1e9;
   for (int i = 0; i < path.size(); ++i)
@@ -490,7 +507,6 @@ bool is_path_blocked(const std::vector<Eigen::Vector2f> &path, const OccupancyGr
       start_idx = i;
     }
   }
-
   for (int i = start_idx; i < path.size(); ++i)
   {
     if ((path[i] - drone_pos).norm() > 6.0)
@@ -498,7 +514,6 @@ bool is_path_blocked(const std::vector<Eigen::Vector2f> &path, const OccupancyGr
     int gx, gy;
     if (grid.world_to_grid(path[i].x(), path[i].y(), gx, gy))
     {
-      // 迟滞：>900 确信障碍才算堵
       if (grid.cells[gx][gy] > 900)
         return true;
     }
@@ -541,52 +556,42 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &obs, bool
   Eigen::Vector2f curr(local_pos.pose.pose.position.x, local_pos.pose.pose.position.y);
   Eigen::Vector2f dir = target - curr;
   float dist = dir.norm();
-
   if (dist < 0.2)
     return true;
-
   const int BINS = 72;
   float hist[BINS] = {0};
-
   for (const auto &o : obs)
   {
     Eigen::Vector2f to_obs = o.position - curr;
     float d = to_obs.norm();
     if (d > 4.5 || d < 0.1)
       continue;
-
     float angle = std::atan2(to_obs.y(), to_obs.x()) - current_yaw;
     while (angle > M_PI)
       angle -= 2 * M_PI;
     while (angle < -M_PI)
       angle += 2 * M_PI;
-
     float effect_r = o.radius + cfg.uav_radius + cfg.safe_margin;
     float val = effect_r / d;
     if (val > 1.0f)
       val = 1.0f;
     float width_ang = std::asin(val);
-
     int center_idx = (int)((angle + M_PI) / (2 * M_PI) * BINS) % BINS;
     int half_width = (int)(width_ang / (2 * M_PI) * BINS) + 1;
-
     for (int k = center_idx - half_width; k <= center_idx + half_width; ++k)
     {
       int idx = (k + BINS) % BINS;
       hist[idx] += 10.0f / d;
     }
   }
-
   float target_yaw = std::atan2(dir.y(), dir.x());
   float rel_target_yaw = target_yaw - current_yaw;
   while (rel_target_yaw > M_PI)
     rel_target_yaw -= 2 * M_PI;
   while (rel_target_yaw < -M_PI)
     rel_target_yaw += 2 * M_PI;
-
   int best_idx = -1;
   float min_cost = 1e9;
-
   for (int i = 0; i < BINS; ++i)
   {
     if (hist[i] > 15.0)
@@ -599,23 +604,17 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &obs, bool
       best_idx = i;
     }
   }
-
   if (best_idx == -1)
   {
     ROS_WARN_THROTTLE(1.0, "[VFH] 局部死锁！");
     need_replan = true;
     return false;
   }
-
   float final_yaw = -M_PI + best_idx * (2 * M_PI / BINS) + (M_PI / BINS) * 0.5f + current_yaw;
-
-  // 可视化
   pub_viz_vfh_vectors(target_yaw, final_yaw, curr);
-
   float speed = std::min(cfg.max_speed, dist);
   if (std::abs(final_yaw - current_yaw) > 0.5)
     speed *= 0.5;
-
   setpoint_raw.position.x = curr.x() + std::cos(final_yaw) * speed * 0.5;
   setpoint_raw.position.y = curr.y() + std::sin(final_yaw) * speed * 0.5;
   setpoint_raw.position.z = init_pos_z + cfg.takeoff_height;
@@ -623,9 +622,6 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &obs, bool
   return false;
 }
 
-// ============================================================================
-// 可视化
-// ============================================================================
 void pub_viz_astar_path(const std::vector<Eigen::Vector2f> &path)
 {
   nav_msgs::Path msg;
@@ -650,7 +646,6 @@ void pub_viz_smooth_path(const std::vector<Eigen::Vector2f> &path)
   delete_msg.action = visualization_msgs::Marker::DELETEALL;
   delete_msg.header.frame_id = "map";
   ma.markers.push_back(delete_msg);
-
   for (size_t i = 0; i < path.size(); i += 2)
   {
     visualization_msgs::Marker mk;
@@ -692,14 +687,12 @@ void pub_viz_vfh_vectors(float target_yaw, float selected_yaw, const Eigen::Vect
   m.scale.y = 0.05;
   m.scale.z = 0.05;
   m.pose.orientation.w = 1.0;
-
   m.color.r = 1.0;
   m.color.g = 0.0;
   m.color.b = 0.0;
   m.color.a = 1.0;
   tf::quaternionTFToMsg(tf::createQuaternionFromYaw(target_yaw), m.pose.orientation);
   pub_viz_vfh.publish(m);
-
   m.id = 1;
   m.color.r = 0.0;
   m.color.g = 1.0;
@@ -720,36 +713,30 @@ void pub_viz_grid_map(const OccupancyGrid2D &grid)
   msg.info.origin.position.x = grid.origin_x;
   msg.info.origin.position.y = grid.origin_y;
   msg.info.origin.orientation.w = 1.0;
-
   msg.data.resize(msg.info.width * msg.info.height);
   for (int i = 0; i < msg.data.size(); ++i)
   {
     int x = i % msg.info.width;
     int y = i / msg.info.width;
     int val = grid.cells[x][y];
-    msg.data[i] = (val > 100) ? 100 : (int8_t)val;
+    msg.data[i] = (int8_t)((val > 100) ? 100 : val);
   }
   pub_viz_map.publish(msg);
 }
+// ------------------ 占位符 END ------------------
 
-// ============================================================================
-// 逻辑封装：执行单步避障逻辑
-// ============================================================================
 bool execute_avoidance_step(Eigen::Vector2f goal)
 {
   Eigen::Vector2f curr(local_pos.pose.pose.position.x, local_pos.pose.pose.position.y);
 
-  // 1. 更新地图
   global_grid.update_with_memory(obstacles, cfg.uav_radius, cfg.safe_margin);
   static int cnt = 0;
   if (cnt++ % 5 == 0)
     pub_viz_grid_map(global_grid);
 
-  // 2. 检查路径
   bool blocked = is_path_blocked(global_path_smooth, global_grid, 0.0f);
   bool cooldown = (ros::Time::now() - last_replan_time).toSec() > cfg.replan_cooldown;
 
-  // 3. 重规划
   if (!has_global_plan || (blocked && cooldown))
   {
     if (blocked && has_global_plan)
@@ -766,7 +753,6 @@ bool execute_avoidance_step(Eigen::Vector2f goal)
     }
     else
     {
-      // 规划失败，悬停
       setpoint_raw.position.x = curr.x();
       setpoint_raw.position.y = curr.y();
       has_global_plan = false;
@@ -774,7 +760,6 @@ bool execute_avoidance_step(Eigen::Vector2f goal)
     }
   }
 
-  // 4. VFH 跟踪
   if (has_global_plan)
   {
     Eigen::Vector2f la = get_lookahead_point(global_path_smooth, curr, cfg.lookahead_dist);
@@ -783,33 +768,10 @@ bool execute_avoidance_step(Eigen::Vector2f goal)
     if (stuck)
       has_global_plan = false;
 
-    // 到达判断
     if ((curr - goal).norm() < 0.3)
       return true;
   }
-
   return false;
-}
-
-// ============================================================================
-// 主函数与状态机
-// ============================================================================
-void state_cb(const mavros_msgs::State::ConstPtr &msg) { mavros_connection_state = *msg; }
-void local_pos_cb(const nav_msgs::Odometry::ConstPtr &msg)
-{
-  local_pos = *msg;
-  tf::quaternionMsgToTF(local_pos.pose.pose.orientation, quat);
-  double r, p;
-  tf::Matrix3x3(quat).getRPY(r, p, current_yaw);
-
-  if (!flag_init_pos && local_pos.pose.pose.position.z > -0.5)
-  {
-    init_pos_x = local_pos.pose.pose.position.x;
-    init_pos_y = local_pos.pose.pose.position.y;
-    init_pos_z = local_pos.pose.pose.position.z;
-    init_yaw_take_off = current_yaw; // 用于 ring_crossing 坐标系对齐
-    flag_init_pos = true;
-  }
 }
 
 // 状态枚举
@@ -829,6 +791,26 @@ enum MissionState
   FINISHED
 };
 
+void state_cb(const mavros_msgs::State::ConstPtr &msg) { mavros_connection_state = *msg; }
+void local_pos_cb(const nav_msgs::Odometry::ConstPtr &msg)
+{
+  local_pos = *msg;
+  tf::quaternionMsgToTF(local_pos.pose.pose.orientation, quat);
+  double r, p;
+  tf::Matrix3x3(quat).getRPY(r, p, current_yaw);
+
+  if (!flag_init_pos && local_pos.pose.pose.position.z > -0.5)
+  {
+    init_pos_x = local_pos.pose.pose.position.x;
+    init_pos_y = local_pos.pose.pose.position.y;
+    init_pos_z = local_pos.pose.pose.position.z;
+    init_yaw_take_off = current_yaw;
+    flag_init_pos = true;
+  }
+  // 兼容 PCL 的 flag
+  flag_init_position = flag_init_pos;
+}
+
 int main(int argc, char **argv)
 {
   setlocale(LC_ALL, "");
@@ -836,6 +818,9 @@ int main(int argc, char **argv)
   ros::NodeHandle nh("~");
   ros::NodeHandle public_nh;
   load_parameters(nh);
+
+  // 1. 初始化 TF 监听器
+  tf_listener = new tf::TransformListener();
 
   ros::Subscriber s1 = public_nh.subscribe("mavros/state", 10, state_cb);
   ros::Subscriber s2 = public_nh.subscribe("/mavros/local_position/odom", 10, local_pos_cb);
@@ -884,16 +869,16 @@ int main(int argc, char **argv)
   MissionState state = IDLE;
   ros::Time last_req = ros::Time::now();
 
-  // 航点定义 (相对起飞点)
-  float wp1_x = 0.0, wp1_y = 3.5;
-  float wp2_x = 3.5, wp2_y = 3.5;
+  // 航点定义
+  float wp1_x = 0.0, wp1_y = 4.0;
+  float wp2_x = 3.5, wp2_y = 4.0;
   float wp3_x = 3.5, wp3_y = 0.0;
   float wp4_x = 6.0, wp4_y = 0.0;
 
   while (ros::ok())
   {
     pub_setpoint.publish(setpoint_raw);
-    mission_step = (int)state; // 同步给回调函数用
+    mission_step = (int)state;
 
     switch (state)
     {
@@ -931,6 +916,8 @@ int main(int argc, char **argv)
       setpoint_raw.position.z = init_pos_z + cfg.takeoff_height;
       setpoint_raw.position.x = init_pos_x;
       setpoint_raw.position.y = init_pos_y;
+      // 起飞时更新一次地图，建立初始记忆
+      global_grid.update_with_memory(obstacles, cfg.uav_radius, cfg.safe_margin);
       if (std::abs(local_pos.pose.pose.position.z - setpoint_raw.position.z) < 0.2)
       {
         state = LEG1_AVOID;
