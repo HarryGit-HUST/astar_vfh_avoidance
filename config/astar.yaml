@@ -13,3 +13,11 @@ planner:
   astar_weight: 1.5
   replan_cooldown: 1.5
   map_decay_rate: 8      # 衰减慢一点，保持记忆
+
+#for fly
+if_debug : 1
+err_max : 0.3
+p_xy : 0.3
+vel_track_max : 0.4
+time_threshold : 3.0
+yolo_follow_kp : -2

@@ -20,6 +20,8 @@ find_package(catkin REQUIRED COMPONENTS
   pcl_ros             # 新增：用于点云处理
   pcl_conversions     # 新增
   pcl_detection
+  vision_msgs
+  message_generation
 )
 
 find_package(PCL REQUIRED)
