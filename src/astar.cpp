@@ -291,7 +291,7 @@ void detection_cb_wrapper(const pcl_detection::ObjectDetectionResult::ConstPtr &
     }
     else if (obs.type == CYLINDER)
     {
-      if (obj.radius > 3.0f)
+      if (obj.radius > 2.0f)
         continue;
       obs.radius = obj.radius;
       obs.length = 0;
@@ -638,7 +638,7 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &obs, bool
       {
         continue; // 圆柱障碍物离得太远时，不考虑它的大小，直接当点处理
       }
-      else if(o.radius > 3.0f)
+      else if(o.radius > 2.0f)
       {
         continue;
       }
