@@ -208,17 +208,13 @@ void detection_cb_wrapper(const pcl_detection::ObjectDetectionResult::ConstPtr &
 {
   if (!flag_init_pos)
     return;
-
-  // [必须添加] 验证新版 PCL 节点的成功标志位
   if (!msg->success)
-  {
-    ROS_WARN_THROTTLE(2.0, "[A*] PCL节点检测状态异常: %s", msg->status_message.c_str());
     return;
-  }
 
   obstacles.clear();
   Eigen::Vector2f drone_p(local_pos.pose.pose.position.x, local_pos.pose.pose.position.y);
 
+  int valid_cnt = 0;
   for (const auto &obj : msg->objects)
   {
     if (!std::isfinite(obj.position.x) || !std::isfinite(obj.position.y))
@@ -226,8 +222,9 @@ void detection_cb_wrapper(const pcl_detection::ObjectDetectionResult::ConstPtr &
 
     float wx = obj.position.x;
     float wy = obj.position.y;
-
     float dist_rel = std::hypot(wx - drone_p.x(), wy - drone_p.y());
+
+    // 过滤太远或太近的物体
     if (dist_rel > 10.0f || dist_rel < 0.1f)
       continue;
 
@@ -236,35 +233,44 @@ void detection_cb_wrapper(const pcl_detection::ObjectDetectionResult::ConstPtr &
     obs.type = obj.type;
     obs.position = Eigen::Vector2f(wx, wy);
 
-    if (obs.type == WALL)
+    if (obs.type == WALL) // 类型 0
     {
-      if (obj.plane_coeffs.size() < 2)
-        continue;
       obs.radius = cfg.wall_radius;
       obs.width = obj.width;
-      obs.length = obj.width;
-      obs.angle = 0;
+      obs.length = obj.width; // 墙的长度取 width
+
+      // [核心修复] 根据 PCL 传来的平面方程(法向量)，计算墙体真实的偏转角度
+      if (obj.plane_coeffs.size() >= 4)
+      {
+        float A = obj.plane_coeffs[0];
+        float B = obj.plane_coeffs[1];
+        // 法向量在 XY 平面的投影是 (A, B)，墙面走向垂直于法向量，即 (-B, A)
+        obs.angle = std::atan2(A, -B);
+      }
+      else
+      {
+        obs.angle = 0; // 降级处理
+      }
+      valid_cnt++;
+      obstacles.push_back(obs);
     }
-    else if (obs.type == RING) // 环门 type=3 过滤
+    else if (obs.type == RING) // 类型 3：环门，不需要建入障碍物地图
     {
       continue;
     }
-    else if (obs.type == PILLAR) // 方柱 type=4
+    else if (obs.type == PILLAR) // 类型 4：方柱
     {
       obs.width = obj.width;
-      obs.length = obj.height;
+      obs.length = obj.height; // OBB 深度
       obs.radius = 0;
       obs.angle = 0;
+      valid_cnt++;
+      obstacles.push_back(obs);
     }
-    else
-    {
-      obs.radius = obj.radius;
-      obs.width = obj.radius * 2;
-      obs.length = obj.radius * 2;
-      obs.angle = 0;
-    }
-    obstacles.push_back(obs);
   }
+
+  // [诊断雷达]：只要节点接通了，终端每秒都会刷出这句话。如果一直不印，说明依然是话题或MD5问题。
+  ROS_INFO_THROTTLE(1.0, "[A* 避障节点] 收到 PCL 数据: 包含 %zu 个物体, 成功解析绘制 %d 个", msg->objects.size(), valid_cnt);
 }
 
 // ------------------ 地图与规划核心函数 ------------------
@@ -300,6 +306,13 @@ void OccupancyGrid2D::update_with_memory(const std::vector<Obstacle> &obstacles,
   Eigen::Vector2f drone_p(local_pos.pose.pose.position.x, local_pos.pose.pose.position.y);
   bool is_fast_turning = std::abs(current_yaw_rate) > cfg.rotation_gating_threshold;
 
+  // [诊断雷达]：如果你发现地图画不出来，看看是不是这里一直报错！
+  if (is_fast_turning)
+  {
+    ROS_WARN_THROTTLE(2.0, "[A* 建图警告] 无人机角速度过大 (%.2f)，为防重影已暂停建图！", current_yaw_rate);
+  }
+
+  // 地图记忆衰减逻辑 (保持不变)
   for (int i = 0; i < GRID_W; ++i)
   {
     for (int j = 0; j < GRID_H; ++j)
@@ -321,6 +334,7 @@ void OccupancyGrid2D::update_with_memory(const std::vector<Obstacle> &obstacles,
     }
   }
 
+  // 如果旋转过快，地图只衰减不新增
   if (is_fast_turning)
     return;
 
@@ -330,9 +344,8 @@ void OccupancyGrid2D::update_with_memory(const std::vector<Obstacle> &obstacles,
     if ((obs.position - drone_p).norm() < 0.2f)
       continue;
 
-    if (obs.type == PILLAR) // [核心修改] 处理方块占据栅格，严格按照长宽比例膨胀
+    if (obs.type == PILLAR)
     {
-      // OBB中心向四周延展 (自身宽度/2 + 留有安全余量)
       float min_x = obs.position.x() - obs.width / 2.0f - total_margin;
       float max_x = obs.position.x() + obs.width / 2.0f + total_margin;
       float min_y = obs.position.y() - obs.length / 2.0f - total_margin;
@@ -347,7 +360,6 @@ void OccupancyGrid2D::update_with_memory(const std::vector<Obstacle> &obstacles,
       max_gx = std::min(GRID_W - 1, max_gx);
       max_gy = std::min(GRID_H - 1, max_gy);
 
-      // 直接把算好的长宽矩形涂黑，拒绝膨胀成圆
       for (int x = min_gx; x <= max_gx; ++x)
       {
         for (int y = min_gy; y <= max_gy; ++y)
@@ -364,13 +376,16 @@ void OccupancyGrid2D::update_with_memory(const std::vector<Obstacle> &obstacles,
       Eigen::Vector2f p2 = obs.position + dir * hl;
       float exp = obs.radius + total_margin;
       float exp_sq = exp * exp;
+
       float min_x = std::min(p1.x(), p2.x()) - exp;
       float max_x = std::max(p1.x(), p2.x()) + exp;
       float min_y = std::min(p1.y(), p2.y()) - exp;
       float max_y = std::max(p1.y(), p2.y()) + exp;
+
       int min_gx, min_gy, max_gx, max_gy;
       world_to_grid(min_x, min_y, min_gx, min_gy);
       world_to_grid(max_x, max_y, max_gx, max_gy);
+
       min_gx = std::max(0, min_gx);
       min_gy = std::max(0, min_gy);
       max_gx = std::min(GRID_W - 1, max_gx);
@@ -914,9 +929,10 @@ int main(int argc, char **argv)
   tf_listener = new tf::TransformListener();
   ros::Duration(0.5).sleep();
 
+  // 必须改回 /pcl_detection/result，因为你的 launch/yaml 里配的就是这个
   ros::Subscriber s1 = public_nh.subscribe("mavros/state", 10, state_cb);
   ros::Subscriber s2 = public_nh.subscribe("/mavros/local_position/odom", 10, local_pos_cb);
-  ros::Subscriber s3 = public_nh.subscribe("/pcl_detection/obstacles", 10, detection_cb_wrapper);
+  ros::Subscriber s3 = public_nh.subscribe("/pcl_detection/result", 10, detection_cb_wrapper);
   ros::Subscriber s4 = public_nh.subscribe("/ring_center", 10, &RingCrossing::vision_cb, &ring_ctrl);
 
   pub_setpoint = public_nh.advertise<mavros_msgs::PositionTarget>("/mavros/setpoint_raw/local", 10);
