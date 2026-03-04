@@ -1,33 +1,69 @@
-#!/bin/zsh
+#!/bin/bash
 
-# 创建会话和第一个窗口
-tmux new-session -d -s ros_session -n main_nodes
+# Session 名称
+SESSION="ros_session"
 
-# Pane 0: roscore
-tmux send-keys -t ros_session:0 'roscore' C-m
+# ================= 配置路径 (实机版) =================
+MAIN_WS=~/first_task_ws
+LAND_WS=~/first_task_ws
+# 实机通常不需要 SIM_WS 和 PX4_PATH (Gazebo 相关)
 
-# Pane 1: utils.launch
-tmux split-window -h -t ros_session:0
-tmux send-keys -t ros_session:0.1 'sleep 3; roslaunch fly_demo utils.launch ' C-m
+# 清理旧环境
+tmux kill-session -t $SESSION 2>/dev/null
+sleep 1
 
-# 整理第一个窗口布局
-tmux select-layout -t ros_session:0 tiled
+# ====================================================
+# 窗口 0: 硬件驱动 (MAVROS + Camera)
+# ====================================================
+tmux new-session -d -s $SESSION -n "hardware_drivers"
 
-# --------------------
-# 第二窗口（监控和任务）
-# --------------------
-tmux new-window -t ros_session:1 -n monitors_mission
+# Pane 0.0: roscore
+tmux send-keys -t $SESSION:0.0 'roscore' C-m
+sleep 2
 
-# Pane 0: /mavros/local_position/pose
-tmux send-keys -t ros_session:1 'sleep 6; rostopic echo /mavros/local_position/pose' C-m
+# Pane 0.1: 实机基础启动 (取代 sim.launch)
+tmux split-window -h -t $SESSION:0
+tmux send-keys -t $SESSION:0.1 "sleep 2; source ${MAIN_WS}/devel/setup.bash; roslaunch tutorial_gazebo utils.launch" C-m
 
-# Pane 3: complete_mission.launch
-tmux split-window -v -t ros_session:1
-tmux send-keys -t ros_session:1.1 'sleep 7; source ~/first_task_ws/devel/setup.zsh; roslaunch collision_avoidance collision_avoidance.launch' C-m
+# ====================================================
+# 窗口 1: PCL 感知 (实机检测)
+# ====================================================
+tmux new-window -t $SESSION:1 -n "pcl_perception"
+# 实机中 obs.bash 可能需要根据实机雷达话题调整
+tmux send-keys -t $SESSION:1 "sleep 8; source ${MAIN_WS}/devel/setup.bash; cd ${MAIN_WS}/src/pcl_detection/shell; bash obs.bash" C-m
 
-# 整理第二个窗口布局
-tmux select-layout -t ros_session:1 tiled
+# ====================================================
+# 窗口 2: 任务控制与视觉 (Mission + YOLO)
+# ====================================================
+tmux new-window -t $SESSION:2 -n "mission_ctrl"
 
-# 附加到会话并显示第一个窗口
-tmux select-window -t ros_session:0
-tmux attach-session -t ros_session:1
+# Pane 2.0: 话题监控
+tmux send-keys -t $SESSION:2.0 "sleep 5; rostopic echo /mavros/local_position/pose" C-m
+
+# Pane 2.1: A* 主控节点
+tmux split-window -v -t $SESSION:2.0
+tmux send-keys -t $SESSION:2.1 "sleep 12; source ${MAIN_WS}/devel/setup.bash; roslaunch astar astar.launch" C-m
+
+# Pane 2.2: YOLO 圆环检测 (实机建议确认是否开启 TensorRT 加速)
+tmux split-window -h -t $SESSION:2.1
+tmux send-keys -t $SESSION:2.2 "sleep 10; source ${MAIN_WS}/devel/setup.bash; rosrun astar ring_detector.py" C-m
+
+# ====================================================
+# 窗口 3: 视觉起降识别 (Scan Land)
+# ====================================================
+tmux new-window -t $SESSION:3 -n "scan_land"
+
+# 实机环境建议先启动感知 Python 节点
+tmux send-keys -t $SESSION:3.0 "sleep 8; source ${LAND_WS}/devel/setup.bash; roslaunch scan_land scan_land_py.launch" C-m
+
+# 启动主逻辑
+tmux split-window -v -t $SESSION:3.0
+tmux send-keys -t $SESSION:3.1 "sleep 15; source ${LAND_WS}/devel/setup.bash; roslaunch scan_land scan_land.launch" C-m
+
+# ====================================================
+# 收尾
+# ====================================================
+tmux select-layout -t $SESSION:2 tiled
+tmux select-window -t $SESSION:2
+tmux select-pane -t $SESSION:2.1
+tmux attach-session -t $SESSION
