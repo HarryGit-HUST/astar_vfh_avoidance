@@ -162,47 +162,80 @@ float dist_sq_point_to_segment(const Eigen::Vector2f &p, const Eigen::Vector2f &
 // 4. 感知与地图模块
 // ============================================================================
 
+// ============================================================================
+// PCL 障碍物回调 (调试版：增加日志 + 加厚墙体)
+// ============================================================================
 void detection_cb_wrapper(const pcl_detection::ObjectDetectionResult::ConstPtr &msg)
 {
   if (!flag_init_pos || !tf_listener)
     return;
 
-  // 始终更新，方便调试。但在起飞前如果地面杂波多，A*可能会报错（已在 run_astar 处理）
+  // 允许在起飞前更新地图以便调试，但要小心地面噪点
+  // if (mission_step < 1) return;
+
   obstacles.clear();
   Eigen::Vector2f drone_p(local_pos.pose.pose.position.x, local_pos.pose.pose.position.y);
   std::string target_frame = "map";
+
+  // [调试] 打印帧ID和物体数量
+  static int log_counter = 0;
+  if (log_counter++ % 10 == 0)
+  {
+    ROS_INFO("[感知] 收到PCL数据, Frame: %s, Time: %.2f, Obj数: %lu",
+             msg->header.frame_id.c_str(), msg->header.stamp.toSec(), msg->objects.size());
+  }
 
   for (const auto &obj : msg->objects)
   {
     if (!std::isfinite(obj.position.x) || !std::isfinite(obj.position.y))
       continue;
 
+    // 1. 坐标转换
     geometry_msgs::PointStamped pt_in, pt_out;
     pt_in.header = msg->header;
     pt_in.point.x = obj.position.x;
     pt_in.point.y = obj.position.y;
     pt_in.point.z = obj.position.z;
+
+    // 如果PCL没填frame_id，强制设为雷达坐标系 (根据你的仿真通常是 livox_frame 或 base_link)
     if (pt_in.header.frame_id.empty())
       pt_in.header.frame_id = "base_link";
 
     try
     {
+      // 等待TF关系（容错）
+      if (!tf_listener->waitForTransform(target_frame, pt_in.header.frame_id, pt_in.header.stamp, ros::Duration(0.1)))
+      {
+        ROS_WARN_THROTTLE(1.0, "[TF] 等待变换超时: %s -> %s", pt_in.header.frame_id.c_str(), target_frame.c_str());
+        continue;
+      }
       tf_listener->transformPoint(target_frame, pt_in, pt_out);
     }
     catch (tf::TransformException &ex)
     {
+      ROS_WARN_THROTTLE(1.0, "[TF] 变换失败: %s", ex.what());
       continue;
     }
 
     float wx = pt_out.point.x;
     float wy = pt_out.point.y;
 
-    // 【关键修复】只过滤特别远的，不要过滤近处的墙！
+    // [调试] 打印墙体坐标信息
+    if (obj.type == 0 && if_debug > 0.5)
+    { // Type 0 是墙
+      ROS_INFO_THROTTLE(1.0, "[墙体] 原始(%.2f, %.2f) -> 世界(%.2f, %.2f), 宽: %.2f",
+                        obj.position.x, obj.position.y, wx, wy, obj.width);
+    }
+
+    // 2. 距离过滤
     float dist_rel = std::hypot(wx - drone_p.x(), wy - drone_p.y());
     if (dist_rel > 10.0f)
       continue;
+
+    // 注意：移除了 <0.5 的近距离过滤，防止把贴脸的墙滤掉！
+    // 只过滤极小噪点
     if (dist_rel < 0.1f)
-      continue; // 只过滤 10cm 内的噪点
+      continue;
 
     Obstacle obs;
     obs.id = 0;
@@ -211,18 +244,45 @@ void detection_cb_wrapper(const pcl_detection::ObjectDetectionResult::ConstPtr &
 
     if (obs.type == WALL)
     {
+      // 处理墙体
       if (obj.plane_coeffs.size() < 2)
         continue;
-      // 【关键修复】加厚墙体，防止穿模
-      obs.radius = 0.15f;
-      obs.length = obj.width;
 
-      // 简单计算角度：假设法向量在xy平面
-      // 严谨做法应对法向量做TF，这里为了稳健暂且保留简化
-      obs.angle = 0;
+      // 法向量转换 (这里简化处理，假设无人机水平飞行，只旋转 Yaw)
+      // 严谨做法应对 Vector3 做法 TF 变换
+      // 这里我们利用位置的差分或者简单的旋转矩阵
+
+      // 既然已经有了 TF Listener，我们用 TF 转换向量最稳妥
+      geometry_msgs::Vector3Stamped vec_in, vec_out;
+      vec_in.header = msg->header;
+      if (vec_in.header.frame_id.empty())
+        vec_in.header.frame_id = "base_link";
+      vec_in.vector.x = obj.plane_coeffs[0]; // nx
+      vec_in.vector.y = obj.plane_coeffs[1]; // ny
+      vec_in.vector.z = 0;
+
+      try
+      {
+        tf_listener->transformVector(target_frame, vec_in, vec_out);
+      }
+      catch (...)
+      {
+        continue;
+      }
+
+      double nx_w = vec_out.vector.x;
+      double ny_w = vec_out.vector.y;
+
+      // 切线方向 = 法向量旋转 90 度
+      obs.angle = std::atan2(nx_w, -ny_w);
+
+      // [核心修改] 加厚墙体！
+      obs.radius = 0.25f; // 设为 25cm 半径 (50cm厚)，保证栅格化一定能捕捉到
+      obs.length = obj.width;
     }
     else
     {
+      // 圆柱
       if (obj.radius > 3.0f)
         continue;
       obs.radius = obj.radius;
@@ -267,7 +327,7 @@ void OccupancyGrid2D::update_with_memory(const std::vector<Obstacle> &obstacles,
 {
   Eigen::Vector2f drone_p(local_pos.pose.pose.position.x, local_pos.pose.pose.position.y);
 
-  // 1. 三区衰减
+  // 1. 三区衰减 (保持不变)
   for (int i = 0; i < GRID_W; ++i)
   {
     for (int j = 0; j < GRID_H; ++j)
@@ -279,21 +339,21 @@ void OccupancyGrid2D::update_with_memory(const std::vector<Obstacle> &obstacles,
         float dist = std::hypot(wx - drone_p.x(), wy - drone_p.y());
         int decay = 0;
         if (dist < 6.0f)
-          decay = 10; // 近处快衰 (纠错)
+          decay = 10;
         else if (dist > 20.0f)
           decay = 2;
-        // 6-20m 记忆区 decay=0
         cells[i][j] = std::max(0, cells[i][j] - decay);
       }
     }
   }
 
   float total_margin = drone_r + safe_margin;
+  int wall_cells_count = 0; // [调试] 统计填了多少格子
+
   for (const auto &obs : obstacles)
   {
-    // 【关键修复】取消 "drone_r + 0.1" 的自我过滤
-    // 只过滤极小范围，防止把贴脸的墙过滤掉
-    if ((obs.position - drone_p).norm() < 0.2f)
+    // [修复] 移除过于激进的自我过滤
+    if ((obs.position - drone_p).norm() < 0.1f)
       continue;
 
     if (obs.type == CYLINDER)
@@ -324,18 +384,22 @@ void OccupancyGrid2D::update_with_memory(const std::vector<Obstacle> &obstacles,
       Eigen::Vector2f dir(cos(obs.angle), sin(obs.angle));
       Eigen::Vector2f p1 = obs.position - dir * hl;
       Eigen::Vector2f p2 = obs.position + dir * hl;
+
+      // 使用 obs.radius (已在回调中加厚) + 安全余量
       float exp = obs.radius + total_margin;
       float exp_sq = exp * exp;
 
-      // 包围盒遍历，效率高
       float min_x = std::min(p1.x(), p2.x()) - exp;
       float max_x = std::max(p1.x(), p2.x()) + exp;
       float min_y = std::min(p1.y(), p2.y()) - exp;
       float max_y = std::max(p1.y(), p2.y()) + exp;
 
       int min_gx, min_gy, max_gx, max_gy;
+      // 即使部分出界也要画，不直接 continue
       world_to_grid(min_x, min_y, min_gx, min_gy);
       world_to_grid(max_x, max_y, max_gx, max_gy);
+
+      // 边界钳位
       min_gx = std::max(0, min_gx);
       min_gy = std::max(0, min_gy);
       max_gx = std::min(GRID_W - 1, max_gx);
@@ -347,12 +411,25 @@ void OccupancyGrid2D::update_with_memory(const std::vector<Obstacle> &obstacles,
         {
           float wx, wy;
           grid_to_world(x, y, wx, wy);
+          // 点到线段距离检测
           if (dist_sq_point_to_segment({wx, wy}, p1, p2) <= exp_sq)
           {
             cells[x][y] = MAX_HEALTH;
+            wall_cells_count++;
           }
         }
       }
+    }
+  }
+
+  // [调试] 如果有墙体数据但没画出格子，打印警告
+  if (obstacles.size() > 0 && wall_cells_count == 0)
+  {
+    ROS_WARN_THROTTLE(1.0, "[地图] 收到 %lu 个障碍物，但未写入任何栅格！检查坐标是否越界。", obstacles.size());
+    if (obstacles[0].type == WALL)
+    {
+      ROS_WARN_THROTTLE(1.0, "[地图] 墙位置: (%.2f, %.2f), 长度: %.2f",
+                        obstacles[0].position.x(), obstacles[0].position.y(), obstacles[0].length);
     }
   }
 }
@@ -881,6 +958,7 @@ int main(int argc, char **argv)
   load_parameters(nh);
 
   tf_listener = new tf::TransformListener();
+  ros::Duration(1.0).sleep();
 
   // 订阅
   ros::Subscriber s1 = public_nh.subscribe("mavros/state", 10, state_cb);
