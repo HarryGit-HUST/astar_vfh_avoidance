@@ -395,6 +395,12 @@ void OccupancyGrid2D::update_with_memory(const std::vector<Obstacle> &obstacles,
   {
     if ((obs.position - drone_p).norm() < 0.2f)
       continue;
+    if   (obs.type ==RING)
+    {
+      // 环门不写入地图，但可以作为 VFH 的动态障碍物
+      continue;
+    }
+    
     if (obs.type == CYLINDER)
     {
       int gx, gy;
@@ -622,11 +628,27 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &obs, bool
   float min_obs_d = 1e9;
   for (const auto &o : obs)
   {
+    if (o.type == RING)
+    {
+      continue; // 环门不参与 VFH 计算
+    }
+    if(o.type ==CYLINDER)
+    {
+      if(o.position.distance(curr) > 5.0f)
+      {
+        continue; // 圆柱障碍物离得太远时，不考虑它的大小，直接当点处理
+      }
+      else if(o.radius > 3.0f)
+      {
+        continue;
+      }
+    }
+    
     Eigen::Vector2f to_obs = o.position - curr;
     float d = to_obs.norm();
     if (d < min_obs_d)
       min_obs_d = d;
-    if (d > 4.5 || d < 0.1)
+    if (d > 3 || d < 0.1)
       continue;
     float angle = std::atan2(to_obs.y(), to_obs.x()) - current_yaw;
     while (angle > M_PI)
