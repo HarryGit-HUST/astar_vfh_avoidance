@@ -158,81 +158,64 @@ float dist_sq_point_to_segment(const Eigen::Vector2f &p, const Eigen::Vector2f &
 }
 
 // ============================================================================
-// 4. 感知模块 (加入延迟补偿)
+// PCL 障碍物回调 (适配 50ms 低延迟 + 增加墙体角度TF变换)
 // ============================================================================
 void detection_cb_wrapper(const pcl_detection::ObjectDetectionResult::ConstPtr &msg)
 {
   if (!flag_init_pos || !tf_listener)
     return;
 
+  // 允许在起飞前更新 (方便调试)
+  // if (mission_step < 1) return;
+
   obstacles.clear();
   Eigen::Vector2f drone_p(local_pos.pose.pose.position.x, local_pos.pose.pose.position.y);
   std::string target_frame = "map";
-
-  // 预估 PCL 处理延迟 (根据你的日志约为 180ms ~ 220ms)
-  // 这是一个 Magic Number，但非常有效：我们将查询的时间点向前推 0.2s
-  ros::Time query_time = msg->header.stamp - ros::Duration(0.2);
-  // 如果 msg->header.stamp 已经是现在的时间(PCL节点重置了时间)，那么 query_time 依然是现在
-  // 如果 PCL 节点保留了原始雷达时间戳，这个操作可能是多余的，但如果 PCL 节点发的是 ros::Time::now()，我们需要手动回溯
-  // 稳妥起见，我们优先信任 msg->header.stamp，如果 TF 查不到，说明时间戳太旧或太新，再做降级
 
   for (const auto &obj : msg->objects)
   {
     if (!std::isfinite(obj.position.x) || !std::isfinite(obj.position.y))
       continue;
 
+    // --- 1. 位置坐标转换 (Point) ---
     geometry_msgs::PointStamped pt_in, pt_out;
-    pt_in.header = msg->header;
-    // 如果 header.stamp 是当前时间，我们需要手动减去延迟
-    if ((ros::Time::now() - msg->header.stamp).toSec() < 0.05)
-    {
-      pt_in.header.stamp = ros::Time::now() - ros::Duration(0.2); // 手动补偿延迟
-    }
-
+    pt_in.header = msg->header; // 直接使用 PCL 的时间戳，不再手动减去延迟
     pt_in.point.x = obj.position.x;
     pt_in.point.y = obj.position.y;
     pt_in.point.z = obj.position.z;
+
     if (pt_in.header.frame_id.empty())
       pt_in.header.frame_id = "base_link";
 
     bool tf_success = false;
     try
     {
-      // [修复] 使用带延迟补偿的时间查询 TF
-      tf_listener->transformPoint(target_frame, pt_in, pt_out);
+      // PCL 只有 50ms 延迟，直接查询 msg 时间戳的 TF 是最准的
+      // 如果报错，说明 TF 树有短暂断连，降级为查询最新时间 Time(0)
+      try
+      {
+        tf_listener->transformPoint(target_frame, pt_in, pt_out);
+      }
+      catch (...)
+      {
+        tf_listener->transformPoint(target_frame, ros::Time(0), pt_in, pt_in.header.frame_id, pt_out);
+      }
       tf_success = true;
     }
     catch (tf::TransformException &ex)
     {
-      // 如果查历史查不到，尝试查最新
-      try
-      {
-        tf_listener->transformPoint(target_frame, ros::Time(0), pt_in, pt_in.header.frame_id, pt_out);
-        tf_success = true;
-      }
-      catch (...)
-      {
-        tf_success = false;
-      }
+      // 极少数情况 TF 完全失效，跳过此物体
+      continue;
     }
 
-    float wx, wy;
-    if (tf_success)
-    {
-      wx = pt_out.point.x;
-      wy = pt_out.point.y;
-    }
-    else
-    {
-      // [降级] 手动硬算
-      float cos_y = cos(current_yaw);
-      float sin_y = sin(current_yaw);
-      wx = drone_p.x() + obj.position.x * cos_y - obj.position.y * sin_y;
-      wy = drone_p.y() + obj.position.x * sin_y + obj.position.y * cos_y;
-    }
+    float wx = pt_out.point.x;
+    float wy = pt_out.point.y;
 
+    // 距离过滤
     float dist_rel = std::hypot(wx - drone_p.x(), wy - drone_p.y());
-    if (dist_rel > 10.0f || dist_rel < 0.1f)
+    if (dist_rel > 10.0f)
+      continue;
+    if (dist_rel < 0.1f)
       continue;
 
     Obstacle obs;
@@ -244,9 +227,38 @@ void detection_cb_wrapper(const pcl_detection::ObjectDetectionResult::ConstPtr &
     {
       if (obj.plane_coeffs.size() < 2)
         continue;
+
       obs.radius = 0.15f;
       obs.length = obj.width;
-      obs.angle = 0;
+
+      // --- 2. 墙体角度转换 (Vector) ---
+      // 墙体法向量是方向向量，不受平移影响，但受旋转影响
+      geometry_msgs::Vector3Stamped vec_in, vec_out;
+      vec_in.header = msg->header;
+      if (vec_in.header.frame_id.empty())
+        vec_in.header.frame_id = "base_link";
+
+      // PCL 的 plane_coeffs[0]=A, [1]=B 是法向量
+      vec_in.vector.x = obj.plane_coeffs[0];
+      vec_in.vector.y = obj.plane_coeffs[1];
+      vec_in.vector.z = 0;
+
+      try
+      {
+        // 注意：这里用 transformVector 而不是 transformPoint
+        tf_listener->transformVector(target_frame, vec_in, vec_out);
+
+        double nx = vec_out.vector.x;
+        double ny = vec_out.vector.y;
+
+        // 墙体走向(切线)是法向量旋转 90 度
+        // Tangent = (-ny, nx)
+        obs.angle = std::atan2(nx, -ny);
+      }
+      catch (...)
+      {
+        obs.angle = 0; // 变换失败保底
+      }
     }
     else
     {
