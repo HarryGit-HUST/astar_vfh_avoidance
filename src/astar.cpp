@@ -289,7 +289,7 @@ void detection_cb_wrapper(const pcl_detection::ObjectDetectionResult::ConstPtr &
         obs.angle = std::atan2(nx_world, -ny_world);
       }
     }
-    else
+    else if (obs.type == CYLINDER)
     {
       if (obj.radius > 3.0f)
         continue;
@@ -297,6 +297,12 @@ void detection_cb_wrapper(const pcl_detection::ObjectDetectionResult::ConstPtr &
       obs.length = 0;
       obs.angle = 0;
     }
+    else 
+    {
+      // 如果是未知类型，跳过处理
+      continue;
+    }
+    
     obstacles.push_back(obs);
   }
 }

@@ -24,8 +24,8 @@ extern float if_debug;
 enum ObsType
 {
     WALL = 0,
-    CYLINDER = 1,
-    CIRCLE = 2
+    CYLINDER = 4,
+    RING =3
 };
 
 // ============================================================================
