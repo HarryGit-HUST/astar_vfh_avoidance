@@ -209,6 +209,13 @@ void detection_cb_wrapper(const pcl_detection::ObjectDetectionResult::ConstPtr &
   if (!flag_init_pos)
     return;
 
+  // [必须添加] 验证新版 PCL 节点的成功标志位
+  if (!msg->success)
+  {
+    ROS_WARN_THROTTLE(2.0, "[A*] PCL节点检测状态异常: %s", msg->status_message.c_str());
+    return;
+  }
+
   obstacles.clear();
   Eigen::Vector2f drone_p(local_pos.pose.pose.position.x, local_pos.pose.pose.position.y);
 
@@ -217,7 +224,6 @@ void detection_cb_wrapper(const pcl_detection::ObjectDetectionResult::ConstPtr &
     if (!std::isfinite(obj.position.x) || !std::isfinite(obj.position.y))
       continue;
 
-    // [重大修改] 由于已经转换到坐标系，直接读取地图系绝对坐标 (去除耗时且无意义的 tf 变换)
     float wx = obj.position.x;
     float wy = obj.position.y;
 
@@ -245,14 +251,13 @@ void detection_cb_wrapper(const pcl_detection::ObjectDetectionResult::ConstPtr &
     }
     else if (obs.type == PILLAR) // 方柱 type=4
     {
-      obs.width = obj.width;   // X 方向含膨胀的尺寸
-      obs.length = obj.height; // Y 方向含膨胀的尺寸
-      obs.radius = 0;          // 不再使用半径
-      obs.angle = 0;           // OBB 假设已经与轴对齐（若需要旋转可从检测端扩展）
+      obs.width = obj.width;
+      obs.length = obj.height;
+      obs.radius = 0;
+      obs.angle = 0;
     }
     else
     {
-      // 容错降级
       obs.radius = obj.radius;
       obs.width = obj.radius * 2;
       obs.length = obj.radius * 2;
@@ -911,7 +916,7 @@ int main(int argc, char **argv)
 
   ros::Subscriber s1 = public_nh.subscribe("mavros/state", 10, state_cb);
   ros::Subscriber s2 = public_nh.subscribe("/mavros/local_position/odom", 10, local_pos_cb);
-  ros::Subscriber s3 = public_nh.subscribe("/pcl_detection/result", 10, detection_cb_wrapper);
+  ros::Subscriber s3 = public_nh.subscribe("/pcl_detection/obstacles", 10, detection_cb_wrapper);
   ros::Subscriber s4 = public_nh.subscribe("/ring_center", 10, &RingCrossing::vision_cb, &ring_ctrl);
 
   pub_setpoint = public_nh.advertise<mavros_msgs::PositionTarget>("/mavros/setpoint_raw/local", 10);
