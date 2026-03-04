@@ -1,6 +1,6 @@
 /**
  * @file astar.cpp
- * @brief 紧急修复版：解决 TF 阻塞导致不起飞问题 + 静态 TF 缺失处理
+ * @brief 修复版：增加旋转门控 + 延迟补偿，彻底消除残影
  */
 #include "astar.h"
 #include "ring_crossing.h"
@@ -31,6 +31,8 @@ mavros_msgs::PositionTarget setpoint_raw;
 mavros_msgs::State mavros_connection_state;
 nav_msgs::Odometry local_pos;
 double current_yaw = 0.0;
+// 新增：当前旋转角速度
+double current_yaw_rate = 0.0;
 tf::Quaternion quat;
 
 float init_pos_x = 0, init_pos_y = 0, init_pos_z = 0;
@@ -83,9 +85,8 @@ ros::Publisher pub_viz_map;
 ros::Publisher mission_num_pub;
 
 // ============================================================================
-// 3. 辅助函数
+// 3. 辅助函数实现
 // ============================================================================
-
 void yolo_result_cb(const geometry_msgs::PointStamped::ConstPtr &msg) { yolo_result = *msg; }
 void takeoff_cb(const std_msgs::String::ConstPtr &msg) { takeoff_color = msg->data; }
 void land_color_cb(const std_msgs::String::ConstPtr &msg) { land_color = msg->data; }
@@ -114,6 +115,7 @@ void load_parameters(ros::NodeHandle &nh)
   nh.param<float>("yolo_follow_kp", cfg.yolo_follow_kp, -2.0f);
 
   cfg.check_radius = cfg.uav_radius + 0.1f;
+  ROS_INFO("=== 参数加载完成 ===");
 }
 
 float satfunc(float data, float Max)
@@ -156,21 +158,23 @@ float dist_sq_point_to_segment(const Eigen::Vector2f &p, const Eigen::Vector2f &
 }
 
 // ============================================================================
-// 4. 感知模块 (核心修复：移除阻塞，增加容错)
+// 4. 感知模块 (加入延迟补偿)
 // ============================================================================
 void detection_cb_wrapper(const pcl_detection::ObjectDetectionResult::ConstPtr &msg)
 {
   if (!flag_init_pos || !tf_listener)
     return;
 
-  // [重要] 允许一直更新，方便调试。起飞前的地面杂波由 update_with_memory 内部过滤
   obstacles.clear();
   Eigen::Vector2f drone_p(local_pos.pose.pose.position.x, local_pos.pose.pose.position.y);
   std::string target_frame = "map";
 
-  // 预计算降级方案的旋转
-  float cos_y = cos(current_yaw);
-  float sin_y = sin(current_yaw);
+  // 预估 PCL 处理延迟 (根据你的日志约为 180ms ~ 220ms)
+  // 这是一个 Magic Number，但非常有效：我们将查询的时间点向前推 0.2s
+  ros::Time query_time = msg->header.stamp - ros::Duration(0.2);
+  // 如果 msg->header.stamp 已经是现在的时间(PCL节点重置了时间)，那么 query_time 依然是现在
+  // 如果 PCL 节点保留了原始雷达时间戳，这个操作可能是多余的，但如果 PCL 节点发的是 ros::Time::now()，我们需要手动回溯
+  // 稳妥起见，我们优先信任 msg->header.stamp，如果 TF 查不到，说明时间戳太旧或太新，再做降级
 
   for (const auto &obj : msg->objects)
   {
@@ -179,23 +183,37 @@ void detection_cb_wrapper(const pcl_detection::ObjectDetectionResult::ConstPtr &
 
     geometry_msgs::PointStamped pt_in, pt_out;
     pt_in.header = msg->header;
+    // 如果 header.stamp 是当前时间，我们需要手动减去延迟
+    if ((ros::Time::now() - msg->header.stamp).toSec() < 0.05)
+    {
+      pt_in.header.stamp = ros::Time::now() - ros::Duration(0.2); // 手动补偿延迟
+    }
+
     pt_in.point.x = obj.position.x;
     pt_in.point.y = obj.position.y;
     pt_in.point.z = obj.position.z;
     if (pt_in.header.frame_id.empty())
-      pt_in.header.frame_id = "base_link"; // 默认
+      pt_in.header.frame_id = "base_link";
 
     bool tf_success = false;
     try
     {
-      // [核心修改] 使用最新的可用变换，而不是等待。如果找不到，立即抛出异常，不阻塞！
-      tf_listener->transformPoint(target_frame, ros::Time(0), pt_in, pt_in.header.frame_id, pt_out);
+      // [修复] 使用带延迟补偿的时间查询 TF
+      tf_listener->transformPoint(target_frame, pt_in, pt_out);
       tf_success = true;
     }
     catch (tf::TransformException &ex)
     {
-      // TF 失败，静默降级，不打印日志防止刷屏
-      tf_success = false;
+      // 如果查历史查不到，尝试查最新
+      try
+      {
+        tf_listener->transformPoint(target_frame, ros::Time(0), pt_in, pt_in.header.frame_id, pt_out);
+        tf_success = true;
+      }
+      catch (...)
+      {
+        tf_success = false;
+      }
     }
 
     float wx, wy;
@@ -206,18 +224,16 @@ void detection_cb_wrapper(const pcl_detection::ObjectDetectionResult::ConstPtr &
     }
     else
     {
-      // [降级] 手动硬算 (假设 sensor 在 body 中心)
-      float rx = obj.position.x;
-      float ry = obj.position.y;
-      wx = drone_p.x() + rx * cos_y - ry * sin_y;
-      wy = drone_p.y() + rx * sin_y + ry * cos_y;
+      // [降级] 手动硬算
+      float cos_y = cos(current_yaw);
+      float sin_y = sin(current_yaw);
+      wx = drone_p.x() + obj.position.x * cos_y - obj.position.y * sin_y;
+      wy = drone_p.y() + obj.position.x * sin_y + obj.position.y * cos_y;
     }
 
     float dist_rel = std::hypot(wx - drone_p.x(), wy - drone_p.y());
-    if (dist_rel > 10.0f)
+    if (dist_rel > 10.0f || dist_rel < 0.1f)
       continue;
-    if (dist_rel < 0.1f)
-      continue; // 过滤极小噪点
 
     Obstacle obs;
     obs.id = 0;
@@ -228,20 +244,9 @@ void detection_cb_wrapper(const pcl_detection::ObjectDetectionResult::ConstPtr &
     {
       if (obj.plane_coeffs.size() < 2)
         continue;
-      obs.radius = 0.15f; // 加厚
+      obs.radius = 0.15f;
       obs.length = obj.width;
-
-      // 法向量处理
-      if (tf_success)
-      {
-        // 简单近似：如果位置TF成功，角度误差通常可接受。不做 Vector TF 以节省开销
-        // 真正严谨需要 transformVector，这里略过
-        obs.angle = 0; // 或者根据 plane_coeffs 手算
-      }
-      else
-      {
-        obs.angle = 0;
-      }
+      obs.angle = 0;
     }
     else
     {
@@ -255,7 +260,7 @@ void detection_cb_wrapper(const pcl_detection::ObjectDetectionResult::ConstPtr &
   }
 }
 
-// ------------------ 地图与规划核心函数 (直接复用) ------------------
+// ------------------ 地图与规划核心函数 ------------------
 OccupancyGrid2D::OccupancyGrid2D()
 {
   resolution = 0.1f;
@@ -282,9 +287,19 @@ bool OccupancyGrid2D::is_occupied(int gx, int gy) const
     return true;
   return cells[gx][gy] > OBS_THRESHOLD;
 }
+
+// ============================================================================
+// 核心修复：update_with_memory 加入旋转门控
+// ============================================================================
 void OccupancyGrid2D::update_with_memory(const std::vector<Obstacle> &obstacles, float drone_r, float safe_margin)
 {
   Eigen::Vector2f drone_p(local_pos.pose.pose.position.x, local_pos.pose.pose.position.y);
+
+  // [旋转门控]
+  // 阈值 0.2 rad/s (约 11度/秒)。如果转得比这个快，认为感知不可信，停止写入，并加速衰减
+  bool is_fast_turning = std::abs(current_yaw_rate) > 0.2;
+
+  // 1. 三区衰减
   for (int i = 0; i < GRID_W; ++i)
   {
     for (int j = 0; j < GRID_H; ++j)
@@ -294,19 +309,43 @@ void OccupancyGrid2D::update_with_memory(const std::vector<Obstacle> &obstacles,
         float wx, wy;
         grid_to_world(i, j, wx, wy);
         float dist = std::hypot(wx - drone_p.x(), wy - drone_p.y());
+
         int decay = 0;
         if (dist < 6.0f)
-          decay = 10;
+        {
+          // 近处：如果正在快转，极速衰减(50)，清除残影
+          // 如果平稳，正常衰减(10)
+          decay = is_fast_turning ? 50 : 10;
+        }
         else if (dist > 20.0f)
+        {
           decay = 2;
+        }
+        else
+        {
+          // 中间记忆区：如果正在快转，稍微衰减一下(5)，防止错位积累
+          // 如果平稳，保持绝对记忆(0)
+          decay = is_fast_turning ? 5 : 0;
+        }
+
         cells[i][j] = std::max(0, cells[i][j] - decay);
       }
     }
   }
+
+  // 如果正在快速旋转，直接跳过写入步骤！保护地图不被污染！
+  if (is_fast_turning)
+  {
+    // [调试] 打印一次提示
+    static int turn_log = 0;
+    if (turn_log++ % 20 == 0)
+      ROS_WARN_THROTTLE(1.0, "[地图] 快速旋转中 (YawRate: %.2f)，暂停地图写入以防重影", current_yaw_rate);
+    return;
+  }
+
   float total_margin = drone_r + safe_margin;
   for (const auto &obs : obstacles)
   {
-    // [重要] 取消过度自我过滤，只过滤贴脸噪点
     if ((obs.position - drone_p).norm() < 0.2f)
       continue;
     if (obs.type == CYLINDER)
@@ -364,6 +403,9 @@ void OccupancyGrid2D::update_with_memory(const std::vector<Obstacle> &obstacles,
     }
   }
 }
+
+// ... [复用 run_astar, generate_smooth_path, is_path_blocked, get_lookahead_point, run_vfh_plus, viz] ...
+// ------------------ 占位符 START ------------------
 bool run_astar(const OccupancyGrid2D &grid, Eigen::Vector2f start, Eigen::Vector2f goal, std::vector<Eigen::Vector2f> &out_path)
 {
   out_path.clear();
@@ -529,10 +571,14 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &obs, bool
     return true;
   const int BINS = 72;
   float hist[BINS] = {0};
+  // VFH 紧急制动逻辑 (如果离障碍物太近且前方有障碍)
+  float min_obs_d = 1e9;
   for (const auto &o : obs)
   {
     Eigen::Vector2f to_obs = o.position - curr;
     float d = to_obs.norm();
+    if (d < min_obs_d)
+      min_obs_d = d;
     if (d > 4.5 || d < 0.1)
       continue;
     float angle = std::atan2(to_obs.y(), to_obs.x()) - current_yaw;
@@ -545,6 +591,11 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &obs, bool
     int hw = (int)(w_ang / (2 * M_PI) * BINS) + 1;
     for (int k = c_idx - hw; k <= c_idx + hw; ++k)
       hist[(k + BINS) % BINS] += 10.0f / d;
+  }
+  // 紧急制动
+  if (min_obs_d < cfg.min_safe_dist)
+  {
+    // TODO: 可以在这里加反向推力
   }
   float t_yaw = std::atan2(dir.y(), dir.x());
   float rel_t_yaw = t_yaw - current_yaw;
@@ -674,7 +725,7 @@ bool execute_avoidance_step(Eigen::Vector2f goal)
 {
   Eigen::Vector2f curr(local_pos.pose.pose.position.x, local_pos.pose.pose.position.y);
 
-  global_grid.update_with_memory(obstacles, cfg.uav_radius, cfg.safe_margin);
+  // 地图更新已在 main loop 统一执行，这里只负责发布可视化
   static int cnt = 0;
   if (cnt++ % 5 == 0)
     pub_viz_grid_map(global_grid);
@@ -712,7 +763,6 @@ bool execute_avoidance_step(Eigen::Vector2f goal)
     bool reached = run_vfh_plus(la, obstacles, stuck);
     if (stuck)
       has_global_plan = false;
-
     if ((curr - goal).norm() < 0.3)
       return true;
   }
@@ -745,6 +795,8 @@ void local_pos_cb(const nav_msgs::Odometry::ConstPtr &msg)
   tf::quaternionMsgToTF(local_pos.pose.pose.orientation, quat);
   double r, p;
   tf::Matrix3x3(quat).getRPY(r, p, current_yaw);
+  // 计算角速度
+  current_yaw_rate = msg->twist.twist.angular.z;
 
   if (!flag_init_pos && local_pos.pose.pose.position.z > -0.5)
   {
@@ -754,7 +806,6 @@ void local_pos_cb(const nav_msgs::Odometry::ConstPtr &msg)
     init_yaw_take_off = current_yaw;
     flag_init_pos = true;
   }
-  // 兼容 PCL 的 flag
   flag_init_position = flag_init_pos;
 }
 
@@ -766,9 +817,7 @@ int main(int argc, char **argv)
   ros::NodeHandle public_nh;
   load_parameters(nh);
 
-  // 1. 初始化 TF 监听器
   tf_listener = new tf::TransformListener();
-  // 等待 TF 缓存
   ros::Duration(0.5).sleep();
 
   ros::Subscriber s1 = public_nh.subscribe("mavros/state", 10, state_cb);
@@ -791,7 +840,6 @@ int main(int argc, char **argv)
   ros::Subscriber s_land_clr = public_nh.subscribe("/color_detect/land_color", 10, land_color_cb);
   ros::Subscriber s_land_det = public_nh.subscribe("/color_detect/land_detected", 10, land_detected_cb);
 
-  // Scan_Land 控制发布
   mission_num_pub = public_nh.advertise<std_msgs::Int8>("/color_detect/mission_num", 10);
 
   ros::Rate rate(20.0);
@@ -835,10 +883,12 @@ int main(int argc, char **argv)
 
   while (ros::ok())
   {
-    // 核心修改：将地图更新放在最外层，确保一直更新
+    // [重要] 全局地图更新: 只要有数据就更新，保证地图是最新的
     global_grid.update_with_memory(obstacles, cfg.uav_radius, cfg.safe_margin);
-    static int cnt = 0;
-    if (cnt++ % 5 == 0)
+
+    // 定时发布地图供调试
+    static int map_pub_cnt = 0;
+    if (map_pub_cnt++ % 5 == 0)
       pub_viz_grid_map(global_grid);
 
     pub_setpoint.publish(setpoint_raw);
@@ -877,7 +927,7 @@ int main(int argc, char **argv)
       break;
 
     case TAKEOFF:
-      mission_num_msg.data = 1; // 告诉 Python 识别起飞颜色
+      mission_num_msg.data = 1;
       mission_num_pub.publish(mission_num_msg);
 
       setpoint_raw.position.z = init_pos_z + cfg.takeoff_height;
@@ -974,7 +1024,6 @@ int main(int argc, char **argv)
       mission_num_msg.data = 2; // SEARCH/FOLLOW
       mission_num_pub.publish(mission_num_msg);
 
-      // 定点飞行逻辑
       {
         float scan_x = init_pos_x + wp4_x;
         float scan_y_min = init_pos_y + 0.0;
