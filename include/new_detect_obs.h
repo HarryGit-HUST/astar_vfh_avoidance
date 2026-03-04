@@ -19,28 +19,29 @@ extern nav_msgs::Odometry local_pos;
 extern float if_debug;
 
 // ============================================================================
-// 核心定义：障碍物类型枚举 (解决 'CYLINDER' was not declared 报错)
+// 核心定义：障碍物类型枚举
 // ============================================================================
 enum ObsType
 {
     WALL = 0,
-    CYLINDER = 4,
-    RING =3
+    RING = 3,  // 强调：环门必定是3
+    PILLAR = 4 // 方柱类型（原CYLINDER）
 };
 
 // ============================================================================
-// 核心定义：增强版障碍物结构体 (解决 'has no member' 报错)
+// 核心定义：增强版障碍物结构体
 // ============================================================================
 struct Obstacle
 {
     int id;
-    int type;                 // 障碍物类型 (WALL / CYLINDER)
+    int type;                 // 障碍物类型 (WALL / RING / PILLAR)
     Eigen::Vector2f position; // 中心位置 (cx, cy)
-    float radius;             // 圆柱半径 或 墙体半厚度
+    float radius;             // 墙体半厚度或遗留的半径属性
 
-    // 墙体专用属性
-    float length; // 墙体长度
-    float angle;  // 墙体朝向 (弧度)
+    // 方柱/墙体 尺寸属性
+    float width;  // X方向尺寸 (含膨胀的 length)
+    float length; // Y方向尺寸 (含膨胀的 width)
+    float angle;  // 朝向 (弧度)
 };
 
 // 全局障碍物列表容器

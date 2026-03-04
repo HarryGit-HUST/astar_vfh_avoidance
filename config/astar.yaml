@@ -2,22 +2,47 @@ target_x: 6.0
 target_y: 0.0
 debug_mode: true
 
+# ==========================================
+# 规划与控制参数 (Planner & Control)
+# ==========================================
 planner:
-  takeoff_height: 0.7    # 起飞和巡航高度
-  uav_radius: 0.3
-  safe_margin: 0.1
-  max_speed: 0.8
-  min_safe_dist: 0.3
+  takeoff_height: 1.2      # 起飞/巡航高度
   
-  lookahead_dist: 1.5
-  astar_weight: 1.5
-  replan_cooldown: 1.5
-  map_decay_rate: 8      # 衰减慢一点，保持记忆
+  # --- 速度与加速度限制 ---
+  max_speed: 0.6           # 最大飞行速度 (m/s)
+  max_yaw_rate: 0.5        # [关键] 最大旋转角速度 (rad/s), 越小转弯越柔和
+  yaw_smooth_weight: 0.1   # [关键] VFH角度低通滤波系数 (0.0~1.0), 越小越平滑但反应越慢
 
-#for fly
-if_debug : 1
-err_max : 0.3
-p_xy : 0.3
-vel_track_max : 0.4
-time_threshold : 3.0
-yolo_follow_kp : -2
+  # --- 避障与地图 ---
+  uav_radius: 0.3          # 无人机碰撞半径
+  safe_margin: 0.1         # 膨胀安全余量
+  min_safe_dist: 0.3       # 紧急制动距离
+  wall_radius: 0.10        # [关键] 墙体在地图上的物理厚度 (m)
+  check_radius_buffer: 0.1 # 路径检查的额外余量
+  
+  # --- 算法参数 ---
+  lookahead_dist: 1.5      # 前视距离
+  astar_weight: 1.2        # A* 启发式权重
+  replan_cooldown: 1.0     # 重规划冷却时间
+  
+  # --- 旋转门控 (防止建图重影) ---
+  map_decay_rate: 2             # 平稳时的地图衰减率
+  rotation_gating_threshold: 0.3 # [关键] 超过此角速度(rad/s)时停止建图
+
+  # --- 任务航点 (根据你的网格图配置) ---
+  # 假设起飞点为 (0,0)
+  wp1: [0.0, 3.5]   # 左上角
+  wp2: [3.5, 3.5]   # 穿门后
+  wp3: [3.5, 0.0]   # 右下角
+  wp4: [6.0, 0.0]   # 终点
+
+# ==========================================
+# 降落识别参数 (Scan & Land)
+# ==========================================
+scan_land:
+ 
+  err_max: 0.3
+  p_xy: 0.3
+  vel_track_max: 0.4
+  time_threshold: 3.0
+  yolo_follow_kp: -2.0

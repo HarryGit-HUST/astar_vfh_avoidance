@@ -1,6 +1,6 @@
 /**
  * @file astar.cpp
- * @brief 修复版：增加旋转门控 + 延迟补偿，彻底消除残影
+ * @brief 终极优化版：平滑转向、参数外置、抗震荡、支持方柱矩形精确膨胀避障
  */
 #include "astar.h"
 #include "ring_crossing.h"
@@ -31,7 +31,6 @@ mavros_msgs::PositionTarget setpoint_raw;
 mavros_msgs::State mavros_connection_state;
 nav_msgs::Odometry local_pos;
 double current_yaw = 0.0;
-// 新增：当前旋转角速度
 double current_yaw_rate = 0.0;
 tf::Quaternion quat;
 
@@ -46,17 +45,20 @@ bool has_global_plan = false;
 OccupancyGrid2D global_grid;
 tf::TransformListener *tf_listener = nullptr;
 
-// === Scan_Land 变量 ===
+// Scan_Land
 std::string takeoff_color = "";
 std::string land_color = "";
 bool land_detected = false;
 geometry_msgs::PointStamped yolo_result;
-
 std_msgs::Int8 mission_num_msg;
 bool search_mode_dir = false;
 
+// VFH 上一帧角度缓存 (用于滤波)
+float last_vfh_yaw = 0.0;
+bool vfh_first_run = true;
+
 // ============================================================================
-// 2. 配置参数
+// 2. 配置参数 (对应 YAML)
 // ============================================================================
 struct Config
 {
@@ -68,8 +70,19 @@ struct Config
   float lookahead_dist;
   float astar_weight;
   float replan_cooldown;
-  float check_radius;
+
+  float check_radius_buffer;
+  float wall_radius;
   int map_decay_rate;
+  float rotation_gating_threshold;
+  float max_yaw_rate;
+  float yaw_smooth_weight;
+
+  std::vector<float> wp1;
+  std::vector<float> wp2;
+  std::vector<float> wp3;
+  std::vector<float> wp4;
+
   float err_max;
   float p_xy;
   float vel_track_max;
@@ -87,6 +100,7 @@ ros::Publisher mission_num_pub;
 // ============================================================================
 // 3. 辅助函数实现
 // ============================================================================
+
 void yolo_result_cb(const geometry_msgs::PointStamped::ConstPtr &msg) { yolo_result = *msg; }
 void takeoff_cb(const std_msgs::String::ConstPtr &msg) { takeoff_color = msg->data; }
 void land_color_cb(const std_msgs::String::ConstPtr &msg) { land_color = msg->data; }
@@ -108,13 +122,24 @@ void load_parameters(ros::NodeHandle &nh)
   nh.param<float>("planner/replan_cooldown", cfg.replan_cooldown, 1.0f);
   nh.param<int>("planner/map_decay_rate", cfg.map_decay_rate, 2);
 
-  nh.param<float>("err_max", cfg.err_max, 0.3f);
-  nh.param<float>("p_xy", cfg.p_xy, 0.3f);
-  nh.param<float>("vel_track_max", cfg.vel_track_max, 0.4f);
-  nh.param<float>("time_threshold", cfg.time_threshold, 3.0f);
-  nh.param<float>("yolo_follow_kp", cfg.yolo_follow_kp, -2.0f);
+  nh.param<float>("planner/check_radius_buffer", cfg.check_radius_buffer, 0.1f);
+  nh.param<float>("planner/wall_radius", cfg.wall_radius, 0.2f);
+  nh.param<float>("planner/rotation_gating_threshold", cfg.rotation_gating_threshold, 0.3f);
+  nh.param<float>("planner/max_yaw_rate", cfg.max_yaw_rate, 0.5f);
+  nh.param<float>("planner/yaw_smooth_weight", cfg.yaw_smooth_weight, 0.1f);
+  nh.param<float>("planner/min_safe_dist", cfg.min_safe_dist, 0.4f);
 
-  cfg.check_radius = cfg.uav_radius + 0.1f;
+  nh.param<std::vector<float>>("planner/wp1", cfg.wp1, {0.0, 3.5});
+  nh.param<std::vector<float>>("planner/wp2", cfg.wp2, {3.5, 3.5});
+  nh.param<std::vector<float>>("planner/wp3", cfg.wp3, {3.5, 0.0});
+  nh.param<std::vector<float>>("planner/wp4", cfg.wp4, {6.0, 0.0});
+
+  nh.param<float>("scan_land/err_max", cfg.err_max, 0.3f);
+  nh.param<float>("scan_land/p_xy", cfg.p_xy, 0.3f);
+  nh.param<float>("scan_land/vel_track_max", cfg.vel_track_max, 0.4f);
+  nh.param<float>("scan_land/time_threshold", cfg.time_threshold, 3.0f);
+  nh.param<float>("scan_land/yolo_follow_kp", cfg.yolo_follow_kp, -2.0f);
+
   ROS_INFO("=== 参数加载完成 ===");
 }
 
@@ -142,6 +167,25 @@ float get_yaw_diff(float target_yaw)
   return std::abs(diff);
 }
 
+float calc_smooth_yaw(float target_yaw, float current_yaw, float dt)
+{
+  float diff = target_yaw - current_yaw;
+  while (diff > M_PI)
+    diff -= 2 * M_PI;
+  while (diff < -M_PI)
+    diff += 2 * M_PI;
+
+  float max_step = cfg.max_yaw_rate * dt;
+  if (std::abs(diff) < max_step)
+  {
+    return target_yaw;
+  }
+  else
+  {
+    return current_yaw + (diff > 0 ? max_step : -max_step);
+  }
+}
+
 float dist_sq_point_to_segment(const Eigen::Vector2f &p, const Eigen::Vector2f &s_start, const Eigen::Vector2f &s_end)
 {
   Eigen::Vector2f v = s_end - s_start;
@@ -158,151 +202,62 @@ float dist_sq_point_to_segment(const Eigen::Vector2f &p, const Eigen::Vector2f &
 }
 
 // ============================================================================
-// PCL 障碍物回调 (适配 180ms 高延迟 + 时间回溯补偿 + 墙体旋转)
+// 4. 感知模块
 // ============================================================================
 void detection_cb_wrapper(const pcl_detection::ObjectDetectionResult::ConstPtr &msg)
 {
-  if (!flag_init_pos || !tf_listener)
+  if (!flag_init_pos)
     return;
-
-  // 允许在起飞前更新 (方便调试)
-  // if (mission_step < 1) return;
 
   obstacles.clear();
   Eigen::Vector2f drone_p(local_pos.pose.pose.position.x, local_pos.pose.pose.position.y);
-  std::string target_frame = "map";
-
-  // 设定 PCL 处理延迟补偿 (180ms)
-  ros::Duration latency_comp(0.18);
 
   for (const auto &obj : msg->objects)
   {
     if (!std::isfinite(obj.position.x) || !std::isfinite(obj.position.y))
       continue;
 
-    // --- 1. 位置坐标转换 (Point) ---
-    geometry_msgs::PointStamped pt_in, pt_out;
-    pt_in.header = msg->header;
-    pt_in.point.x = obj.position.x;
-    pt_in.point.y = obj.position.y;
-    pt_in.point.z = obj.position.z;
+    // [重大修改] 由于已经转换到坐标系，直接读取地图系绝对坐标 (去除耗时且无意义的 tf 变换)
+    float wx = obj.position.x;
+    float wy = obj.position.y;
 
-    if (pt_in.header.frame_id.empty())
-      pt_in.header.frame_id = "base_link";
-
-    // [核心保护]：时间回溯
-    // 如果消息时间戳离现在非常近 (<50ms)，说明PCL节点重置了时间戳
-    // 我们需要手动减去 180ms，回到雷达扫描的真实时刻去查询 TF
-    if ((ros::Time::now() - msg->header.stamp).toSec() < 0.05)
-    {
-      pt_in.header.stamp = ros::Time::now() - latency_comp;
-    }
-
-    bool tf_success = false;
-    try
-    {
-      // 使用回溯后的时间戳查询 TF
-      // transformPoint 会自动处理平移+旋转
-      tf_listener->transformPoint(target_frame, pt_in, pt_out);
-      tf_success = true;
-    }
-    catch (tf::TransformException &ex)
-    {
-      // 如果查历史查不到(缓存不够)，尝试查最新
-      try
-      {
-        tf_listener->transformPoint(target_frame, ros::Time(0), pt_in, pt_in.header.frame_id, pt_out);
-        tf_success = true;
-      }
-      catch (...)
-      {
-        tf_success = false;
-      }
-    }
-
-    float wx, wy;
-    if (tf_success)
-    {
-      wx = pt_out.point.x;
-      wy = pt_out.point.y;
-    }
-    else
-    {
-      // [降级] 手动硬算 (不推荐，但在 TF 挂掉时保命)
-      float cos_y = cos(current_yaw);
-      float sin_y = sin(current_yaw);
-      wx = drone_p.x() + obj.position.x * cos_y - obj.position.y * sin_y;
-      wy = drone_p.y() + obj.position.x * sin_y + obj.position.y * cos_y;
-    }
-
-    // 距离过滤
     float dist_rel = std::hypot(wx - drone_p.x(), wy - drone_p.y());
-    if (dist_rel > 10.0f)
-      continue;
-    if (dist_rel < 0.1f)
+    if (dist_rel > 10.0f || dist_rel < 0.1f)
       continue;
 
     Obstacle obs;
     obs.id = 0;
-    obs.type = (obj.type == 0) ? WALL : CYLINDER;
+    obs.type = obj.type;
     obs.position = Eigen::Vector2f(wx, wy);
 
     if (obs.type == WALL)
     {
       if (obj.plane_coeffs.size() < 2)
         continue;
-
-      obs.radius = 0.10f;
+      obs.radius = cfg.wall_radius;
+      obs.width = obj.width;
       obs.length = obj.width;
-
-      // --- 2. 墙体角度转换 (Vector) ---
-      // 墙体法向量必须也进行同样的 TF 旋转，否则墙体朝向会错
-      geometry_msgs::Vector3Stamped vec_in, vec_out;
-
-      // 重要：使用和 Point 转换完全相同的时间戳 header
-      vec_in.header = pt_in.header;
-
-      vec_in.vector.x = obj.plane_coeffs[0]; // nx
-      vec_in.vector.y = obj.plane_coeffs[1]; // ny
-      vec_in.vector.z = 0;
-
-      try
-      {
-        // transformVector 只处理旋转，忽略平移
-        tf_listener->transformVector(target_frame, vec_in, vec_out);
-
-        double nx = vec_out.vector.x;
-        double ny = vec_out.vector.y;
-
-        // 墙体走向(切线) = 法向量旋转 90 度
-        // Tangent = (-ny, nx)
-        obs.angle = std::atan2(nx, -ny);
-      }
-      catch (...)
-      {
-        // 如果 Vector 变换失败，使用当前机头朝向做近似计算
-        float cy = cos(current_yaw), sy = sin(current_yaw);
-        double nx_local = obj.plane_coeffs[0];
-        double ny_local = obj.plane_coeffs[1];
-        double nx_world = nx_local * cy - ny_local * sy;
-        double ny_world = nx_local * sy + ny_local * cy;
-        obs.angle = std::atan2(nx_world, -ny_world);
-      }
-    }
-    else if (obs.type == CYLINDER)
-    {
-      if (obj.radius > 2.0f)
-        continue;
-      obs.radius = obj.radius;
-      obs.length = 0;
       obs.angle = 0;
     }
-    else 
+    else if (obs.type == RING) // 环门 type=3 过滤
     {
-      // 如果是未知类型，跳过处理
       continue;
     }
-    
+    else if (obs.type == PILLAR) // 方柱 type=4
+    {
+      obs.width = obj.width;   // X 方向含膨胀的尺寸
+      obs.length = obj.height; // Y 方向含膨胀的尺寸
+      obs.radius = 0;          // 不再使用半径
+      obs.angle = 0;           // OBB 假设已经与轴对齐（若需要旋转可从检测端扩展）
+    }
+    else
+    {
+      // 容错降级
+      obs.radius = obj.radius;
+      obs.width = obj.radius * 2;
+      obs.length = obj.radius * 2;
+      obs.angle = 0;
+    }
     obstacles.push_back(obs);
   }
 }
@@ -335,18 +290,11 @@ bool OccupancyGrid2D::is_occupied(int gx, int gy) const
   return cells[gx][gy] > OBS_THRESHOLD;
 }
 
-// ============================================================================
-// 核心修复：update_with_memory 加入旋转门控
-// ============================================================================
 void OccupancyGrid2D::update_with_memory(const std::vector<Obstacle> &obstacles, float drone_r, float safe_margin)
 {
   Eigen::Vector2f drone_p(local_pos.pose.pose.position.x, local_pos.pose.pose.position.y);
+  bool is_fast_turning = std::abs(current_yaw_rate) > cfg.rotation_gating_threshold;
 
-  // [旋转门控]
-  // 阈值 0.2 rad/s (约 11度/秒)。如果转得比这个快，认为感知不可信，停止写入，并加速衰减
-  bool is_fast_turning = std::abs(current_yaw_rate) > 0.2;
-
-  // 1. 三区衰减
   for (int i = 0; i < GRID_W; ++i)
   {
     for (int j = 0; j < GRID_H; ++j)
@@ -356,69 +304,50 @@ void OccupancyGrid2D::update_with_memory(const std::vector<Obstacle> &obstacles,
         float wx, wy;
         grid_to_world(i, j, wx, wy);
         float dist = std::hypot(wx - drone_p.x(), wy - drone_p.y());
-
         int decay = 0;
         if (dist < 6.0f)
-        {
-          // 近处：如果正在快转，极速衰减(50)，清除残影
-          // 如果平稳，正常衰减(10)
           decay = is_fast_turning ? 50 : 10;
-        }
         else if (dist > 20.0f)
-        {
           decay = 2;
-        }
         else
-        {
-          // 中间记忆区：如果正在快转，稍微衰减一下(5)，防止错位积累
-          // 如果平稳，保持绝对记忆(0)
           decay = is_fast_turning ? 5 : 0;
-        }
-
         cells[i][j] = std::max(0, cells[i][j] - decay);
       }
     }
   }
 
-  // 如果正在快速旋转，直接跳过写入步骤！保护地图不被污染！
   if (is_fast_turning)
-  {
-    // [调试] 打印一次提示
-    static int turn_log = 0;
-    if (turn_log++ % 20 == 0)
-      ROS_WARN_THROTTLE(1.0, "[地图] 快速旋转中 (YawRate: %.2f)，暂停地图写入以防重影", current_yaw_rate);
     return;
-  }
 
   float total_margin = drone_r + safe_margin;
   for (const auto &obs : obstacles)
   {
     if ((obs.position - drone_p).norm() < 0.2f)
       continue;
-    if   (obs.type ==RING)
+
+    if (obs.type == PILLAR) // [核心修改] 处理方块占据栅格，严格按照长宽比例膨胀
     {
-      // 环门不写入地图，但可以作为 VFH 的动态障碍物
-      continue;
-    }
-    
-    if (obs.type == CYLINDER)
-    {
-      int gx, gy;
-      if (!world_to_grid(obs.position.x(), obs.position.y(), gx, gy))
-        continue;
-      float effect_r = obs.radius + total_margin;
-      int r_cells = std::ceil(effect_r / resolution);
-      float r_sq = pow(effect_r / resolution, 2);
-      for (int dx = -r_cells; dx <= r_cells; ++dx)
+      // OBB中心向四周延展 (自身宽度/2 + 留有安全余量)
+      float min_x = obs.position.x() - obs.width / 2.0f - total_margin;
+      float max_x = obs.position.x() + obs.width / 2.0f + total_margin;
+      float min_y = obs.position.y() - obs.length / 2.0f - total_margin;
+      float max_y = obs.position.y() + obs.length / 2.0f + total_margin;
+
+      int min_gx, min_gy, max_gx, max_gy;
+      world_to_grid(min_x, min_y, min_gx, min_gy);
+      world_to_grid(max_x, max_y, max_gx, max_gy);
+
+      min_gx = std::max(0, min_gx);
+      min_gy = std::max(0, min_gy);
+      max_gx = std::min(GRID_W - 1, max_gx);
+      max_gy = std::min(GRID_H - 1, max_gy);
+
+      // 直接把算好的长宽矩形涂黑，拒绝膨胀成圆
+      for (int x = min_gx; x <= max_gx; ++x)
       {
-        for (int dy = -r_cells; dy <= r_cells; ++dy)
+        for (int y = min_gy; y <= max_gy; ++y)
         {
-          int nx = gx + dx, ny = gy + dy;
-          if (nx >= 0 && nx < GRID_W && ny >= 0 && ny < GRID_H)
-          {
-            if (dx * dx + dy * dy <= r_sq)
-              cells[nx][ny] = MAX_HEALTH;
-          }
+          cells[x][y] = MAX_HEALTH;
         }
       }
     }
@@ -448,17 +377,13 @@ void OccupancyGrid2D::update_with_memory(const std::vector<Obstacle> &obstacles,
           float wx, wy;
           grid_to_world(x, y, wx, wy);
           if (dist_sq_point_to_segment({wx, wy}, p1, p2) <= exp_sq)
-          {
             cells[x][y] = MAX_HEALTH;
-          }
         }
       }
     }
   }
 }
 
-// ... [复用 run_astar, generate_smooth_path, is_path_blocked, get_lookahead_point, run_vfh_plus, viz] ...
-// ------------------ 占位符 START ------------------
 bool run_astar(const OccupancyGrid2D &grid, Eigen::Vector2f start, Eigen::Vector2f goal, std::vector<Eigen::Vector2f> &out_path)
 {
   out_path.clear();
@@ -500,9 +425,7 @@ bool run_astar(const OccupancyGrid2D &grid, Eigen::Vector2f start, Eigen::Vector
     for (int i = 0; i < 8; ++i)
     {
       int nx = cx + dx[i], ny = cy + dy[i];
-      if (nx < 0 || nx >= 200 || ny < 0 || ny >= 200)
-        continue;
-      if (grid.is_occupied(nx, ny))
+      if (nx < 0 || nx >= 200 || ny < 0 || ny >= 200 || grid.is_occupied(nx, ny))
         continue;
       int nid = nx * 200 + ny;
       float ng = g_cost[curr] + dists[i];
@@ -537,6 +460,7 @@ bool run_astar(const OccupancyGrid2D &grid, Eigen::Vector2f start, Eigen::Vector
   }
   return true;
 }
+
 std::vector<Eigen::Vector2f> BSplinePlanner::generate_smooth_path(const std::vector<Eigen::Vector2f> &cps, int points_per_seg)
 {
   std::vector<Eigen::Vector2f> result;
@@ -559,6 +483,7 @@ std::vector<Eigen::Vector2f> BSplinePlanner::generate_smooth_path(const std::vec
   result.push_back(cps.back());
   return result;
 }
+
 bool is_path_blocked(const std::vector<Eigen::Vector2f> &path, const OccupancyGrid2D &grid, float check_radius)
 {
   if (path.empty())
@@ -586,6 +511,7 @@ bool is_path_blocked(const std::vector<Eigen::Vector2f> &path, const OccupancyGr
   }
   return false;
 }
+
 Eigen::Vector2f get_lookahead_point(const std::vector<Eigen::Vector2f> &path, Eigen::Vector2f curr_pos, float lookahead_dist)
 {
   if (path.empty())
@@ -614,6 +540,8 @@ Eigen::Vector2f get_lookahead_point(const std::vector<Eigen::Vector2f> &path, Ei
   }
   return path.back();
 }
+
+// ------------------ VFH+ 优化 (完美支持方柱视场阻挡) ------------------
 bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &obs, bool &need_replan)
 {
   need_replan = false;
@@ -622,56 +550,125 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &obs, bool
   float dist = dir.norm();
   if (dist < 0.2)
     return true;
+
+  if (vfh_first_run)
+  {
+    last_vfh_yaw = current_yaw;
+    vfh_first_run = false;
+  }
+
   const int BINS = 72;
   float hist[BINS] = {0};
-  // VFH 紧急制动逻辑 (如果离障碍物太近且前方有障碍)
   float min_obs_d = 1e9;
+
   for (const auto &o : obs)
   {
     if (o.type == RING)
-    {
-      continue; // 环门不参与 VFH 计算
-    }
-    if(o.type ==CYLINDER)
-    {
-      if(o.position.distance(curr) > 5.0f)
-      {
-        continue; // 圆柱障碍物离得太远时，不考虑它的大小，直接当点处理
-      }
-      else if(o.radius > 2.0f)
-      {
-        continue;
-      }
-    }
-    
-    Eigen::Vector2f to_obs = o.position - curr;
-    float d = to_obs.norm();
-    if (d < min_obs_d)
-      min_obs_d = d;
-    if (d > 3 || d < 0.1)
       continue;
-    float angle = std::atan2(to_obs.y(), to_obs.x()) - current_yaw;
-    while (angle > M_PI)
-      angle -= 2 * M_PI;
-    while (angle < -M_PI)
-      angle += 2 * M_PI;
-    float w_ang = std::asin(std::min(1.0f, (o.radius + cfg.uav_radius + cfg.safe_margin) / d));
-    int c_idx = (int)((angle + M_PI) / (2 * M_PI) * BINS) % BINS;
-    int hw = (int)(w_ang / (2 * M_PI) * BINS) + 1;
-    for (int k = c_idx - hw; k <= c_idx + hw; ++k)
-      hist[(k + BINS) % BINS] += 10.0f / d;
+
+    if (o.type == PILLAR)
+    {
+      // [核心修改] VFH矩形精确视场遮挡（FOV block），不膨胀圆
+      float total_margin = cfg.uav_radius + cfg.safe_margin;
+      float min_x = o.position.x() - o.width / 2.0f - total_margin;
+      float max_x = o.position.x() + o.width / 2.0f + total_margin;
+      float min_y = o.position.y() - o.length / 2.0f - total_margin;
+      float max_y = o.position.y() + o.length / 2.0f + total_margin;
+
+      // 计算无人机到该膨胀后矩形框的最短距离
+      float dx = std::max({min_x - curr.x(), 0.0f, curr.x() - max_x});
+      float dy = std::max({min_y - curr.y(), 0.0f, curr.y() - max_y});
+      float d = std::hypot(dx, dy);
+
+      if (d < min_obs_d)
+        min_obs_d = d;
+      if (d > 3.0 || d < 0.1)
+        continue;
+
+      // 提取四个角，算它们针对无人机当前视角的偏差
+      Eigen::Vector2f corners[4] = {{min_x, min_y}, {min_x, max_y}, {max_x, min_y}, {max_x, max_y}};
+      std::vector<float> angles;
+      for (int i = 0; i < 4; ++i)
+      {
+        float ang = std::atan2(corners[i].y() - curr.y(), corners[i].x() - curr.x()) - current_yaw;
+        while (ang > M_PI)
+          ang -= 2 * M_PI;
+        while (ang < -M_PI)
+          ang += 2 * M_PI;
+        angles.push_back(ang);
+      }
+
+      // 通过寻找最大缝隙(Max Gap)解决 -PI 到 PI 的跳变问题，锁定阻挡视场的真实起点和终点
+      std::sort(angles.begin(), angles.end());
+      float max_gap = angles[0] + 2 * M_PI - angles[3];
+      int gap_idx = 3;
+      for (int i = 0; i < 3; ++i)
+      {
+        float gap = angles[i + 1] - angles[i];
+        if (gap > max_gap)
+        {
+          max_gap = gap;
+          gap_idx = i;
+        }
+      }
+
+      float start_ang, end_ang;
+      if (gap_idx != 3)
+      {
+        start_ang = angles[gap_idx + 1];
+        end_ang = angles[gap_idx] + 2 * M_PI; // 将终点跨越映射为连贯的角度
+      }
+      else
+      {
+        start_ang = angles[0];
+        end_ang = angles[3];
+      }
+
+      // 阻塞被方柱完全覆盖的扇区直方图
+      int steps = std::ceil((end_ang - start_ang) / (2 * M_PI / BINS));
+      for (int k = 0; k <= steps; ++k)
+      {
+        float a = start_ang + k * (2 * M_PI / BINS);
+        int idx = (int)((a + M_PI) / (2 * M_PI) * BINS) % BINS;
+        if (idx < 0)
+          idx += BINS;
+        hist[idx] += 10.0f / (d + 0.1f);
+      }
+    }
+    else if (o.type == WALL)
+    {
+      Eigen::Vector2f to_obs = o.position - curr;
+      float d = to_obs.norm();
+      if (d < min_obs_d)
+        min_obs_d = d;
+      if (d > 3.0 || d < 0.1)
+        continue;
+      float angle = std::atan2(to_obs.y(), to_obs.x()) - current_yaw;
+      while (angle > M_PI)
+        angle -= 2 * M_PI;
+      while (angle < -M_PI)
+        angle += 2 * M_PI;
+      float w_ang = std::asin(std::min(1.0f, (o.radius + cfg.uav_radius + cfg.safe_margin) / d));
+      int c_idx = (int)((angle + M_PI) / (2 * M_PI) * BINS) % BINS;
+      int hw = (int)(w_ang / (2 * M_PI) * BINS) + 1;
+      for (int k = c_idx - hw; k <= c_idx + hw; ++k)
+        hist[(k + BINS) % BINS] += 10.0f / d;
+    }
   }
-  // 紧急制动
+
   if (min_obs_d < cfg.min_safe_dist)
   {
-    // TODO: 可以在这里加反向推力
+    need_replan = true;
+    return false;
   }
+
   float t_yaw = std::atan2(dir.y(), dir.x());
   float rel_t_yaw = t_yaw - current_yaw;
   while (rel_t_yaw > M_PI)
     rel_t_yaw -= 2 * M_PI;
   while (rel_t_yaw < -M_PI)
     rel_t_yaw += 2 * M_PI;
+
   int best_idx = -1;
   float min_c = 1e9;
   for (int i = 0; i < BINS; ++i)
@@ -679,30 +676,47 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &obs, bool
     if (hist[i] > 15.0)
       continue;
     float b_yaw = -M_PI + i * (2 * M_PI / BINS) + (M_PI / BINS) * 0.5f;
-    float c = std::abs(b_yaw - rel_t_yaw) + hist[i] * 0.1f;
+    float diff_last = std::abs(b_yaw - (last_vfh_yaw - current_yaw));
+    while (diff_last > M_PI)
+      diff_last -= 2 * M_PI;
+    float c = std::abs(b_yaw - rel_t_yaw) + hist[i] * 0.1f + std::abs(diff_last) * 0.5f;
     if (c < min_c)
     {
       min_c = c;
       best_idx = i;
     }
   }
+
   if (best_idx == -1)
   {
     ROS_WARN_THROTTLE(1.0, "[VFH] 局部死锁！");
     need_replan = true;
     return false;
   }
-  float final_yaw = -M_PI + best_idx * (2 * M_PI / BINS) + (M_PI / BINS) * 0.5f + current_yaw;
+
+  float selected_yaw = -M_PI + best_idx * (2 * M_PI / BINS) + (M_PI / BINS) * 0.5f + current_yaw;
+  float diff = selected_yaw - last_vfh_yaw;
+  while (diff > M_PI)
+    diff -= 2 * M_PI;
+  while (diff < -M_PI)
+    diff += 2 * M_PI;
+
+  float final_yaw = last_vfh_yaw + diff * cfg.yaw_smooth_weight;
+  last_vfh_yaw = final_yaw;
+
   pub_viz_vfh_vectors(t_yaw, final_yaw, curr);
+
   float speed = std::min(cfg.max_speed, dist);
-  if (std::abs(final_yaw - current_yaw) > 0.5)
-    speed *= 0.5;
+  if (std::abs(diff) > 0.5)
+    speed *= 0.3;
+
   setpoint_raw.position.x = curr.x() + std::cos(final_yaw) * speed * 0.5;
   setpoint_raw.position.y = curr.y() + std::sin(final_yaw) * speed * 0.5;
   setpoint_raw.position.z = init_pos_z + cfg.takeoff_height;
   setpoint_raw.yaw = final_yaw;
   return false;
 }
+
 void pub_viz_astar_path(const std::vector<Eigen::Vector2f> &path)
 {
   nav_msgs::Path msg;
@@ -788,32 +802,32 @@ void pub_viz_grid_map(const OccupancyGrid2D &grid)
     msg.data[i] = (int8_t)((grid.cells[i % 200][i / 200] > 100) ? 100 : grid.cells[i % 200][i / 200]);
   pub_viz_map.publish(msg);
 }
-// ------------------ 占位符 END ------------------
 
+// ============================================================================
+// 逻辑封装：执行单步避障
+// ============================================================================
 bool execute_avoidance_step(Eigen::Vector2f goal)
 {
   Eigen::Vector2f curr(local_pos.pose.pose.position.x, local_pos.pose.pose.position.y);
+  global_grid.update_with_memory(obstacles, cfg.uav_radius, cfg.safe_margin);
 
-  // 地图更新已在 main loop 统一执行，这里只负责发布可视化
   static int cnt = 0;
   if (cnt++ % 5 == 0)
     pub_viz_grid_map(global_grid);
 
-  bool blocked = is_path_blocked(global_path_smooth, global_grid, 0.0f);
+  bool blocked = is_path_blocked(global_path_smooth, global_grid, cfg.check_radius_buffer);
   bool cooldown = (ros::Time::now() - last_replan_time).toSec() > cfg.replan_cooldown;
 
   if (!has_global_plan || (blocked && cooldown))
   {
     if (blocked && has_global_plan)
       ROS_WARN("路径被动态障碍物截断，重规划...");
-
     if (run_astar(global_grid, curr, goal, global_path_raw))
     {
       global_path_smooth = BSplinePlanner::generate_smooth_path(global_path_raw, 10);
       has_global_plan = true;
       last_replan_time = ros::Time::now();
-      pub_viz_astar_path(global_path_raw);
-      pub_viz_smooth_path(global_path_smooth);
+      vfh_first_run = true;
       ROS_INFO("规划成功，平滑路径点: %lu", global_path_smooth.size());
     }
     else
@@ -827,9 +841,16 @@ bool execute_avoidance_step(Eigen::Vector2f goal)
 
   if (has_global_plan)
   {
+    if (cnt % 5 == 0)
+    {
+      pub_viz_astar_path(global_path_raw);
+      pub_viz_smooth_path(global_path_smooth);
+    }
+
     Eigen::Vector2f la = get_lookahead_point(global_path_smooth, curr, cfg.lookahead_dist);
     bool stuck = false;
     bool reached = run_vfh_plus(la, obstacles, stuck);
+
     if (stuck)
       has_global_plan = false;
     if ((curr - goal).norm() < 0.3)
@@ -838,7 +859,6 @@ bool execute_avoidance_step(Eigen::Vector2f goal)
   return false;
 }
 
-// 状态枚举
 enum MissionState
 {
   IDLE,
@@ -864,7 +884,6 @@ void local_pos_cb(const nav_msgs::Odometry::ConstPtr &msg)
   tf::quaternionMsgToTF(local_pos.pose.pose.orientation, quat);
   double r, p;
   tf::Matrix3x3(quat).getRPY(r, p, current_yaw);
-  // 计算角速度
   current_yaw_rate = msg->twist.twist.angular.z;
 
   if (!flag_init_pos && local_pos.pose.pose.position.z > -0.5)
@@ -886,6 +905,7 @@ int main(int argc, char **argv)
   ros::NodeHandle public_nh;
   load_parameters(nh);
 
+  // tf_listener 保留定义避免外部依赖崩溃，但核心感知已不再使用
   tf_listener = new tf::TransformListener();
   ros::Duration(0.5).sleep();
 
@@ -903,7 +923,6 @@ int main(int argc, char **argv)
   ros::ServiceClient client_arm = public_nh.serviceClient<mavros_msgs::CommandBool>("mavros/cmd/arming");
   ros::ServiceClient client_mode = public_nh.serviceClient<mavros_msgs::SetMode>("mavros/set_mode");
 
-  // Scan_Land 订阅
   ros::Subscriber s_yolo = public_nh.subscribe("/yolo/detection", 10, yolo_result_cb);
   ros::Subscriber s_takeoff = public_nh.subscribe("/color_detect/takeoff_color", 10, takeoff_cb);
   ros::Subscriber s_land_clr = public_nh.subscribe("/color_detect/land_color", 10, land_color_cb);
@@ -944,24 +963,16 @@ int main(int argc, char **argv)
   MissionState state = IDLE;
   ros::Time last_req = ros::Time::now();
 
-  // 航点定义
-  float wp1_x = 0.0, wp1_y = 3.5;
-  float wp2_x = 3.5, wp2_y = 3.5;
-  float wp3_x = 3.5, wp3_y = 0.0;
-  float wp4_x = 6.0, wp4_y = 0.0;
-
   while (ros::ok())
   {
-    // [重要] 全局地图更新: 只要有数据就更新，保证地图是最新的
     global_grid.update_with_memory(obstacles, cfg.uav_radius, cfg.safe_margin);
-
-    // 定时发布地图供调试
     static int map_pub_cnt = 0;
     if (map_pub_cnt++ % 5 == 0)
       pub_viz_grid_map(global_grid);
 
     pub_setpoint.publish(setpoint_raw);
     mission_step = (int)state;
+    float dt = 0.05f;
 
     switch (state)
     {
@@ -998,11 +1009,9 @@ int main(int argc, char **argv)
     case TAKEOFF:
       mission_num_msg.data = 1;
       mission_num_pub.publish(mission_num_msg);
-
       setpoint_raw.position.z = init_pos_z + cfg.takeoff_height;
       setpoint_raw.position.x = init_pos_x;
       setpoint_raw.position.y = init_pos_y;
-
       if (std::abs(local_pos.pose.pose.position.z - setpoint_raw.position.z) < 0.2)
       {
         state = LEG1_AVOID;
@@ -1012,7 +1021,7 @@ int main(int argc, char **argv)
       break;
 
     case LEG1_AVOID:
-      if (execute_avoidance_step({init_pos_x + wp1_x, init_pos_y + wp1_y}))
+      if (execute_avoidance_step({init_pos_x + cfg.wp1[0], init_pos_y + cfg.wp1[1]}))
       {
         state = TURN1;
         ROS_INFO(">>> 转向右");
@@ -1020,8 +1029,11 @@ int main(int argc, char **argv)
       break;
 
     case TURN1:
-      setpoint_raw.yaw = init_yaw_take_off - M_PI / 2.0;
-      if (get_yaw_diff(setpoint_raw.yaw) < 0.1)
+    {
+      float target_yaw = init_yaw_take_off + M_PI / 2.0 - M_PI / 2.0;
+      setpoint_raw.yaw = calc_smooth_yaw(target_yaw, setpoint_raw.yaw, dt);
+      setpoint_raw.type_mask = 0b101111111000;
+      if (get_yaw_diff(target_yaw) < 0.1)
       {
         ros::Duration(1.0).sleep();
         state = LEG2_CROSS;
@@ -1029,22 +1041,28 @@ int main(int argc, char **argv)
         ROS_INFO(">>> 视觉穿门");
       }
       break;
+    }
 
     case LEG2_CROSS:
-      if (ring_ctrl.compute_cmd(local_pos, current_yaw, setpoint_raw) || get_dist(wp2_x, wp2_y) < 0.5)
+    {
+      float d2 = get_dist(cfg.wp2[0], cfg.wp2[1]);
+      if (ring_ctrl.compute_cmd(local_pos, current_yaw, setpoint_raw) || d2 < 0.5)
       {
         state = RECOVER;
         ROS_INFO(">>> 恢复位置控制");
         setpoint_raw.type_mask = 0b101111111000;
         setpoint_raw.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
         setpoint_raw.position.z = init_pos_z + cfg.takeoff_height;
+        setpoint_raw.position.x = init_pos_x + cfg.wp2[0];
+        setpoint_raw.position.y = init_pos_y + cfg.wp2[1];
       }
       break;
+    }
 
     case RECOVER:
-      setpoint_raw.position.x = init_pos_x + wp2_x;
-      setpoint_raw.position.y = init_pos_y + wp2_y;
-      if (get_dist(wp2_x, wp2_y) < 0.3)
+      setpoint_raw.position.x = init_pos_x + cfg.wp2[0];
+      setpoint_raw.position.y = init_pos_y + cfg.wp2[1];
+      if (get_dist(cfg.wp2[0], cfg.wp2[1]) < 0.3)
       {
         state = TURN2;
         ROS_INFO(">>> 转向下");
@@ -1052,17 +1070,20 @@ int main(int argc, char **argv)
       break;
 
     case TURN2:
-      setpoint_raw.yaw = init_yaw_take_off + M_PI;
-      if (get_yaw_diff(setpoint_raw.yaw) < 0.1)
+    {
+      float target_yaw = init_yaw_take_off + M_PI / 2.0 + M_PI;
+      setpoint_raw.yaw = calc_smooth_yaw(target_yaw, setpoint_raw.yaw, dt);
+      if (get_yaw_diff(target_yaw) < 0.1)
       {
         state = LEG3_AVOID;
         has_global_plan = false;
         ROS_INFO(">>> 避障前往 WP3");
       }
       break;
+    }
 
     case LEG3_AVOID:
-      if (execute_avoidance_step({init_pos_x + wp3_x, init_pos_y + wp3_y}))
+      if (execute_avoidance_step({init_pos_x + cfg.wp3[0], init_pos_y + cfg.wp3[1]}))
       {
         state = TURN3;
         ROS_INFO(">>> 转向右");
@@ -1070,17 +1091,20 @@ int main(int argc, char **argv)
       break;
 
     case TURN3:
-      setpoint_raw.yaw = init_yaw_take_off - M_PI / 2.0;
-      if (get_yaw_diff(setpoint_raw.yaw) < 0.1)
+    {
+      float target_yaw = init_yaw_take_off + M_PI / 2.0 - M_PI / 2.0;
+      setpoint_raw.yaw = calc_smooth_yaw(target_yaw, setpoint_raw.yaw, dt);
+      if (get_yaw_diff(target_yaw) < 0.1)
       {
         state = LEG4_FINAL;
         has_global_plan = false;
         ROS_INFO(">>> 前往终点");
       }
       break;
+    }
 
     case LEG4_FINAL:
-      if (execute_avoidance_step({init_pos_x + wp4_x, init_pos_y + wp4_y}))
+      if (execute_avoidance_step({init_pos_x + cfg.wp4[0], init_pos_y + cfg.wp4[1]}))
       {
         state = LANDING_SEARCH;
         ROS_INFO(">>> 降落搜索");
@@ -1090,19 +1114,16 @@ int main(int argc, char **argv)
       break;
 
     case LANDING_SEARCH:
-      mission_num_msg.data = 2; // SEARCH/FOLLOW
+      mission_num_msg.data = 2;
       mission_num_pub.publish(mission_num_msg);
-
       {
-        float scan_x = init_pos_x + wp4_x;
-        float scan_y_min = init_pos_y + 0.0;
-        float scan_y_max = init_pos_y + 4.0;
-
-        setpoint_raw.type_mask = 0b101111111000; // Pos + Yaw
+        float scan_x = init_pos_x + cfg.wp4[0];
+        float scan_y_min = init_pos_y + cfg.wp4[1];
+        float scan_y_max = init_pos_y + cfg.wp4[1] + 4.0;
+        setpoint_raw.type_mask = 0b101111111000;
         setpoint_raw.position.x = scan_x;
         setpoint_raw.position.z = init_pos_z + cfg.takeoff_height;
-        setpoint_raw.yaw = init_yaw_take_off - M_PI / 2.0;
-
+        setpoint_raw.yaw = calc_smooth_yaw(init_yaw_take_off - M_PI / 2.0, setpoint_raw.yaw, dt);
         if (!search_mode_dir)
         {
           setpoint_raw.position.y = scan_y_max;
@@ -1116,7 +1137,6 @@ int main(int argc, char **argv)
             search_mode_dir = false;
         }
       }
-
       if (land_detected && takeoff_color == land_color && yolo_result.point.z > 0.5)
       {
         state = LANDING_FOLLOW;
@@ -1128,7 +1148,6 @@ int main(int argc, char **argv)
     case LANDING_FOLLOW:
       mission_num_msg.data = 2;
       mission_num_pub.publish(mission_num_msg);
-
       if (ros::Time::now() - last_req > ros::Duration(cfg.time_threshold) && !land_detected)
       {
         state = LANDING_SEARCH;
@@ -1137,16 +1156,13 @@ int main(int argc, char **argv)
       }
       if (land_detected)
         last_req = ros::Time::now();
-
       {
         float vx = satfunc(yolo_result.point.y * cfg.yolo_follow_kp, cfg.vel_track_max);
         float vy = satfunc(yolo_result.point.x * cfg.yolo_follow_kp, cfg.vel_track_max);
-
-        setpoint_raw.type_mask = 0b100111000011; // Vx, Vy, Z, Yaw
+        setpoint_raw.type_mask = 0b100111000011;
         setpoint_raw.velocity.x = vx;
         setpoint_raw.velocity.y = vy;
         setpoint_raw.position.z = init_pos_z + cfg.takeoff_height;
-
         if (std::hypot(yolo_result.point.x, yolo_result.point.y) < 0.1)
         {
           state = LANDING_DESCEND;
@@ -1158,7 +1174,6 @@ int main(int argc, char **argv)
     case LANDING_DESCEND:
       mission_num_msg.data = 3;
       mission_num_pub.publish(mission_num_msg);
-
       setpoint_raw.type_mask = 0b101111111000;
       setpoint_raw.position.x = local_pos.pose.pose.position.x;
       setpoint_raw.position.y = local_pos.pose.pose.position.y;

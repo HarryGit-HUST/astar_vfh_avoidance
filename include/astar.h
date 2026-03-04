@@ -1,7 +1,3 @@
-/*******************************************************************************
- * @file astar.h
- * @brief 无人机全自主任务系统 (A*避障 + 穿门 + 起降识别)
- ******************************************************************************/
 #ifndef ASTAR_H
 #define ASTAR_H
 
@@ -29,7 +25,7 @@
 #include <queue>
 #include <string>
 
-// 新增依赖
+// 依赖库
 #include <std_msgs/Bool.h>
 #include <std_msgs/Int8.h>
 #include <std_msgs/String.h>
@@ -50,11 +46,11 @@ extern double current_yaw;
 extern float init_pos_x, init_pos_y, init_pos_z;
 extern bool flag_init_pos;
 
-// === Scan_Land 接口变量 ===
-extern std::string takeoff_color;               // 起飞识别到的颜色
-extern std::string land_color;                  // 降落识别到的颜色
-extern bool land_detected;                      // 是否看到降落标
-extern geometry_msgs::PointStamped yolo_result; // 降落对准偏差
+// Scan_Land 接口变量
+extern std::string takeoff_color;
+extern std::string land_color;
+extern bool land_detected;
+extern geometry_msgs::PointStamped yolo_result;
 
 // ============================================================================
 // 工具类与函数
@@ -86,7 +82,7 @@ void load_parameters(ros::NodeHandle &nh);
 void state_cb(const mavros_msgs::State::ConstPtr &msg);
 void local_pos_cb(const nav_msgs::Odometry::ConstPtr &msg);
 
-// === 新增回调声明 ===
+// 回调声明
 void yolo_result_cb(const geometry_msgs::PointStamped::ConstPtr &msg);
 void takeoff_cb(const std_msgs::String::ConstPtr &msg);
 void land_color_cb(const std_msgs::String::ConstPtr &msg);
@@ -98,7 +94,7 @@ void pub_viz_smooth_path(const std::vector<Eigen::Vector2f> &path);
 void pub_viz_vfh_vectors(float target_yaw, float selected_yaw, const Eigen::Vector2f &pos);
 void pub_viz_grid_map(const OccupancyGrid2D &grid);
 
-// 规划
+// 规划算法
 bool run_astar(const OccupancyGrid2D &grid, Eigen::Vector2f start, Eigen::Vector2f goal, std::vector<Eigen::Vector2f> &out_path);
 bool is_path_blocked(const std::vector<Eigen::Vector2f> &path, const OccupancyGrid2D &grid, float check_radius);
 Eigen::Vector2f get_lookahead_point(const std::vector<Eigen::Vector2f> &path, Eigen::Vector2f curr_pos, float lookahead_dist);
@@ -106,5 +102,12 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &obs, bool
 
 // 辅助函数
 float satfunc(float data, float Max);
+bool control_by_vel(float x, float y, float z, float target_yaw, float error_max, float vel_max, float kp);
+
+// [核心新增] 平滑转向控制函数
+// target_yaw: 目标角度
+// dt: 时间步长 (通常 0.05s)
+// 返回值: 这一帧应该设置的 setpoint_yaw
+float calc_smooth_yaw(float target_yaw, float current_yaw, float dt);
 
 #endif // ASTAR_H
