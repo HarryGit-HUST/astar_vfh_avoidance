@@ -36,12 +36,15 @@ struct Obstacle
     int id;
     int type;                 // 障碍物类型 (WALL / RING / PILLAR)
     Eigen::Vector2f position; // 中心位置 (cx, cy)
-    float radius;             // 墙体半厚度或遗留的半径属性
+    float radius;             // 墙体厚度/圆柱半径
 
-    // 方柱/墙体 尺寸属性
-    float width;  // X方向尺寸 (含膨胀的 length)
-    float length; // Y方向尺寸 (含膨胀的 width)
-    float angle;  // 朝向 (弧度)
+    // 墙体/老尺寸保留
+    float width;
+    float length;
+    float angle;
+
+    // [终极新增]：真实 OBB 在 2D 地图上的多边形投影轮廓 (凸包)
+    std::vector<Eigen::Vector2f> footprint;
 };
 
 // 全局障碍物列表容器

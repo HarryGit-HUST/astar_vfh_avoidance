@@ -200,6 +200,62 @@ float dist_sq_point_to_segment(const Eigen::Vector2f &p, const Eigen::Vector2f &
   Eigen::Vector2f pb = s_start + b * v;
   return (p - pb).squaredNorm();
 }
+// ---------------------------------------------------------
+// [新增] 2D 计算几何工具集：处理 OBB 投影与凸包
+// ---------------------------------------------------------
+
+// 1. 叉积计算：判断 O->A->B 是左拐(>0)还是右拐(<0)
+float cross2d(const Eigen::Vector2f &O, const Eigen::Vector2f &A, const Eigen::Vector2f &B)
+{
+  return (A.x() - O.x()) * (B.y() - O.y()) - (A.y() - O.y()) * (B.x() - O.x());
+}
+
+// 2. 凸包算法 (Monotone Chain)：将散点连成严格逆时针的凸多边形
+std::vector<Eigen::Vector2f> getConvexHull(std::vector<Eigen::Vector2f> pts)
+{
+  if (pts.size() <= 2)
+    return pts;
+  std::sort(pts.begin(), pts.end(), [](const Eigen::Vector2f &a, const Eigen::Vector2f &b)
+            { return a.x() < b.x() || (std::abs(a.x() - b.x()) < 1e-5 && a.y() < b.y()); });
+  std::vector<Eigen::Vector2f> hull;
+  for (const auto &p : pts)
+  { // 下半凸包
+    while (hull.size() >= 2 && cross2d(hull[hull.size() - 2], hull.back(), p) <= 0)
+      hull.pop_back();
+    hull.push_back(p);
+  }
+  size_t lower_size = hull.size();
+  for (int i = pts.size() - 2; i >= 0; --i)
+  { // 上半凸包
+    while (hull.size() > lower_size && cross2d(hull[hull.size() - 2], hull.back(), pts[i]) <= 0)
+      hull.pop_back();
+    hull.push_back(pts[i]);
+  }
+  if (hull.size() > 1)
+    hull.pop_back(); // 移除重复的起点
+  return hull;       // 返回严格逆时针的多边形轮廓
+}
+
+// 3. 计算点到凸多边形的最短距离 (内部为0，外部为到边缘的最短距离)
+float distToPolygon(const Eigen::Vector2f &pt, const std::vector<Eigen::Vector2f> &poly)
+{
+  if (poly.empty())
+    return 1e9;
+  bool inside = true;
+  float min_dist_sq = 1e9;
+  int n = poly.size();
+  for (int i = 0; i < n; ++i)
+  {
+    Eigen::Vector2f p1 = poly[i];
+    Eigen::Vector2f p2 = poly[(i + 1) % n];
+    if (cross2d(p1, p2, pt) < 0)
+      inside = false; // 右拐说明点在边界外
+    float d_sq = dist_sq_point_to_segment(pt, p1, p2);
+    if (d_sq < min_dist_sq)
+      min_dist_sq = d_sq;
+  }
+  return inside ? 0.0f : std::sqrt(min_dist_sq);
+}
 
 // ============================================================================
 // 4. 感知模块
@@ -258,14 +314,37 @@ void detection_cb_wrapper(const pcl_detection::ObjectDetectionResult::ConstPtr &
     {
       continue;
     }
-    else if (obs.type == PILLAR) // 类型 4：方柱
+    else if (obs.type == PILLAR) // 类型 4：方柱 (OBB 完美解析)
     {
-      obs.width = obj.width;
-      obs.length = obj.height; // OBB 深度
-      obs.radius = 0;
-      obs.angle = 0;
-      valid_cnt++;
-      obstacles.push_back(obs);
+      if (obj.obb_coeffs.size() >= 15)
+      {
+        Eigen::Vector3f center(obj.obb_coeffs[0], obj.obb_coeffs[1], obj.obb_coeffs[2]);
+        Eigen::Vector3f a0(obj.obb_coeffs[3], obj.obb_coeffs[4], obj.obb_coeffs[5]);
+        Eigen::Vector3f a1(obj.obb_coeffs[6], obj.obb_coeffs[7], obj.obb_coeffs[8]);
+        Eigen::Vector3f a2(obj.obb_coeffs[9], obj.obb_coeffs[10], obj.obb_coeffs[11]);
+        float l = obj.obb_coeffs[12];
+        float w = obj.obb_coeffs[13];
+        float h = obj.obb_coeffs[14];
+
+        std::vector<Eigen::Vector2f> pts_2d;
+        // 计算 8 个顶点的空间坐标，并直接拍扁投影到 2D 平面
+        for (int i : {-1, 1})
+        {
+          for (int j : {-1, 1})
+          {
+            for (int k : {-1, 1})
+            {
+              Eigen::Vector3f pt = center + (i * l / 2.0f) * a0 + (j * w / 2.0f) * a1 + (k * h / 2.0f) * a2;
+              pts_2d.push_back(Eigen::Vector2f(pt.x(), pt.y()));
+            }
+          }
+        }
+        // 计算真正的二维阴影轮廓
+        obs.footprint = getConvexHull(pts_2d);
+        obs.position = Eigen::Vector2f(center.x(), center.y());
+        valid_cnt++;
+        obstacles.push_back(obs);
+      }
     }
   }
 
@@ -346,25 +425,46 @@ void OccupancyGrid2D::update_with_memory(const std::vector<Obstacle> &obstacles,
 
     if (obs.type == PILLAR)
     {
-      float min_x = obs.position.x() - obs.width / 2.0f - total_margin;
-      float max_x = obs.position.x() + obs.width / 2.0f + total_margin;
-      float min_y = obs.position.y() - obs.length / 2.0f - total_margin;
-      float max_y = obs.position.y() + obs.length / 2.0f + total_margin;
+      if (obs.footprint.empty())
+        continue;
+
+      // 1. 框出这个多边形的极大粗略 AABB (加上安全膨胀区) 减少遍历范围
+      float min_x = 1e9, max_x = -1e9, min_y = 1e9, max_y = -1e9;
+      for (const auto &p : obs.footprint)
+      {
+        if (p.x() < min_x)
+          min_x = p.x();
+        if (p.x() > max_x)
+          max_x = p.x();
+        if (p.y() < min_y)
+          min_y = p.y();
+        if (p.y() > max_y)
+          max_y = p.y();
+      }
+      min_x -= total_margin;
+      max_x += total_margin;
+      min_y -= total_margin;
+      max_y += total_margin;
 
       int min_gx, min_gy, max_gx, max_gy;
       world_to_grid(min_x, min_y, min_gx, min_gy);
       world_to_grid(max_x, max_y, max_gx, max_gy);
-
       min_gx = std::max(0, min_gx);
       min_gy = std::max(0, min_gy);
       max_gx = std::min(GRID_W - 1, max_gx);
       max_gy = std::min(GRID_H - 1, max_gy);
 
+      // 2. 只有距离多边形物理边缘 <= total_margin 的栅格，才被精确涂黑
       for (int x = min_gx; x <= max_gx; ++x)
       {
         for (int y = min_gy; y <= max_gy; ++y)
         {
-          cells[x][y] = MAX_HEALTH;
+          float wx, wy;
+          grid_to_world(x, y, wx, wy);
+          if (distToPolygon({wx, wy}, obs.footprint) <= total_margin)
+          {
+            cells[x][y] = MAX_HEALTH;
+          }
         }
       }
     }
@@ -626,34 +726,21 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &obs, bool
 
     if (o.type == PILLAR)
     {
-      // 1. [核心修复 A] 计算无人机到方柱的【物理真实距离】(不加 margin)
-      float phys_min_x = o.position.x() - o.width / 2.0f;
-      float phys_max_x = o.position.x() + o.width / 2.0f;
-      float phys_min_y = o.position.y() - o.length / 2.0f;
-      float phys_max_y = o.position.y() + o.length / 2.0f;
+      if (o.footprint.empty())
+        continue;
 
-      float phys_dx = std::max({phys_min_x - curr.x(), 0.0f, curr.x() - phys_max_x});
-      float phys_dy = std::max({phys_min_y - curr.y(), 0.0f, curr.y() - phys_max_y});
-      float phys_d = std::hypot(phys_dx, phys_dy);
-
-      // 用真实的物理距离来判断是否需要紧急制动
+      // 1. 计算无人机到该多边形(物理实体)的最短距离
+      float phys_d = distToPolygon(curr, o.footprint);
       if (phys_d < min_obs_d)
         min_obs_d = phys_d;
       if (phys_d > 3.0 || phys_d < 0.05)
-        continue; // 过滤太远或雷达噪点
+        continue;
 
-      // 2. 计算 VFH 视场阻挡 FOV 时，依然使用【膨胀边界】，保障机体不擦碰
-      float total_margin = cfg.uav_radius + cfg.safe_margin;
-      float inf_min_x = phys_min_x - total_margin;
-      float inf_max_x = phys_max_x + total_margin;
-      float inf_min_y = phys_min_y - total_margin;
-      float inf_max_y = phys_max_y + total_margin;
-
-      Eigen::Vector2f corners[4] = {{inf_min_x, inf_min_y}, {inf_min_x, inf_max_y}, {inf_max_x, inf_min_y}, {inf_max_x, inf_max_y}};
+      // 2. 精确计算 FOV 视角阻挡：遍历多边形的每一个角点求角度！
       std::vector<float> angles;
-      for (int i = 0; i < 4; ++i)
+      for (const auto &pt : o.footprint)
       {
-        float ang = std::atan2(corners[i].y() - curr.y(), corners[i].x() - curr.x()) - current_yaw;
+        float ang = std::atan2(pt.y() - curr.y(), pt.x() - curr.x()) - current_yaw;
         while (ang > M_PI)
           ang -= 2 * M_PI;
         while (ang < -M_PI)
@@ -661,10 +748,13 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &obs, bool
         angles.push_back(ang);
       }
 
+      // 添加无人机尺寸和安全系数导致的视角膨胀补偿
+      float margin_angle = std::asin(std::min(1.0f, (cfg.uav_radius + cfg.safe_margin) / (phys_d + 0.1f)));
+
       std::sort(angles.begin(), angles.end());
-      float max_gap = angles[0] + 2 * M_PI - angles[3];
-      int gap_idx = 3;
-      for (int i = 0; i < 3; ++i)
+      float max_gap = angles[0] + 2 * M_PI - angles.back();
+      int gap_idx = angles.size() - 1;
+      for (size_t i = 0; i < angles.size() - 1; ++i)
       {
         float gap = angles[i + 1] - angles[i];
         if (gap > max_gap)
@@ -675,15 +765,15 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &obs, bool
       }
 
       float start_ang, end_ang;
-      if (gap_idx != 3)
+      if (gap_idx != angles.size() - 1)
       {
-        start_ang = angles[gap_idx + 1];
-        end_ang = angles[gap_idx] + 2 * M_PI;
+        start_ang = angles[gap_idx + 1] - margin_angle;
+        end_ang = angles[gap_idx] + 2 * M_PI + margin_angle;
       }
       else
       {
-        start_ang = angles[0];
-        end_ang = angles[3];
+        start_ang = angles[0] - margin_angle;
+        end_ang = angles.back() + margin_angle;
       }
 
       int steps = std::ceil((end_ang - start_ang) / (2 * M_PI / BINS));
@@ -693,7 +783,6 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &obs, bool
         int idx = (int)((a + M_PI) / (2 * M_PI) * BINS) % BINS;
         if (idx < 0)
           idx += BINS;
-        // 斥力基于真实距离衰减
         hist[idx] += 10.0f / (phys_d + 0.1f);
       }
     }
