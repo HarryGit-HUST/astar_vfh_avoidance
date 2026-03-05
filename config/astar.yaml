@@ -16,17 +16,17 @@ planner:
   # --- 避障与地图 ---
   uav_radius: 0.3          # 无人机碰撞半径
   safe_margin: 0.1         # 膨胀安全余量
-  min_safe_dist: 0.3       # 紧急制动距离
+  min_safe_dist: 0.01       # 紧急制动距离
   wall_radius: 0.10        # [关键] 墙体在地图上的物理厚度 (m)
-  check_radius_buffer: 0.1 # 路径检查的额外余量
+  check_radius_buffer: 0.2 # 路径检查的额外余量
   
   # --- 算法参数 ---
   lookahead_dist: 1.5      # 前视距离
   astar_weight: 1.2        # A* 启发式权重
-  replan_cooldown: 1.0     # 重规划冷却时间
+  replan_cooldown: 1.5     # 重规划冷却时间
   
   # --- 旋转门控 (防止建图重影) ---
-  map_decay_rate: 2             # 平稳时的地图衰减率
+  map_decay_rate: 3             # 平稳时的地图衰减率
   rotation_gating_threshold: 0.3 # [关键] 超过此角速度(rad/s)时停止建图
 
   # --- 任务航点 (根据你的网格图配置) ---

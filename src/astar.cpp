@@ -483,25 +483,64 @@ bool run_astar(const OccupancyGrid2D &grid, Eigen::Vector2f start, Eigen::Vector
 
 std::vector<Eigen::Vector2f> BSplinePlanner::generate_smooth_path(const std::vector<Eigen::Vector2f> &cps, int points_per_seg)
 {
-  std::vector<Eigen::Vector2f> result;
+  std::vector<Eigen::Vector2f> raw_spline;
   if (cps.size() < 2)
     return cps;
+
+  // 1. 传统 B-Spline 生成 (保证几何上的 C2 连续，即曲率连续)
   std::vector<Eigen::Vector2f> pts = cps;
   pts.insert(pts.begin(), cps[0]);
   pts.insert(pts.begin(), cps[0]);
   pts.insert(pts.end(), cps.back());
   pts.insert(pts.end(), cps.back());
+
   for (size_t i = 0; i < pts.size() - 3; ++i)
   {
     for (int j = 0; j < points_per_seg; ++j)
     {
       float u = (float)j / points_per_seg;
-      float b0 = (1 - u) * (1 - u) * (1 - u) / 6, b1 = (3 * u * u * u - 6 * u * u + 4) / 6, b2 = (-3 * u * u * u + 3 * u * u + 3 * u + 1) / 6, b3 = u * u * u / 6;
-      result.push_back(b0 * pts[i] + b1 * pts[i + 1] + b2 * pts[i + 2] + b3 * pts[i + 3]);
+      float b0 = (1 - u) * (1 - u) * (1 - u) / 6;
+      float b1 = (3 * u * u * u - 6 * u * u + 4) / 6;
+      float b2 = (-3 * u * u * u + 3 * u * u + 3 * u + 1) / 6;
+      float b3 = u * u * u / 6;
+      raw_spline.push_back(b0 * pts[i] + b1 * pts[i + 1] + b2 * pts[i + 2] + b3 * pts[i + 3]);
     }
   }
-  result.push_back(cps.back());
-  return result;
+  raw_spline.push_back(cps.back());
+
+  // 2. [核心运动学优化]：等弧长重采样 (Arc-length Resampling)
+  // 消除参数曲线点分布不均导致的加速度阶跃，使前视点匀速滑移，大幅提升无人机飞行丝滑度
+  std::vector<Eigen::Vector2f> resampled_path;
+  resampled_path.push_back(raw_spline.front());
+
+  float step_size = 0.1f; // 严格规定每 0.1 米一个航点
+  float dist_accum = 0.0f;
+
+  for (size_t i = 0; i < raw_spline.size() - 1; ++i)
+  {
+    Eigen::Vector2f p1 = raw_spline[i];
+    Eigen::Vector2f p2 = raw_spline[i + 1];
+    float segment_len = (p2 - p1).norm();
+    if (segment_len < 1e-4)
+      continue;
+
+    Eigen::Vector2f dir = (p2 - p1) / segment_len;
+    float dist_left = segment_len;
+
+    while (dist_accum + dist_left >= step_size)
+    {
+      float travel = step_size - dist_accum;
+      Eigen::Vector2f new_pt = p1 + dir * travel;
+      resampled_path.push_back(new_pt);
+      p1 = new_pt;
+      dist_left -= travel;
+      dist_accum = 0.0f;
+    }
+    dist_accum += dist_left;
+  }
+  resampled_path.push_back(raw_spline.back());
+
+  return resampled_path;
 }
 
 bool is_path_blocked(const std::vector<Eigen::Vector2f> &path, const OccupancyGrid2D &grid, float check_radius)
@@ -561,7 +600,6 @@ Eigen::Vector2f get_lookahead_point(const std::vector<Eigen::Vector2f> &path, Ei
   return path.back();
 }
 
-// ------------------ VFH+ 优化 (完美支持方柱视场阻挡) ------------------
 bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &obs, bool &need_replan)
 {
   need_replan = false;
@@ -579,7 +617,7 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &obs, bool
 
   const int BINS = 72;
   float hist[BINS] = {0};
-  float min_obs_d = 1e9;
+  float min_obs_d = 1e9; // 仅记录无人机到物体的【物理真实距离】
 
   for (const auto &o : obs)
   {
@@ -588,25 +626,30 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &obs, bool
 
     if (o.type == PILLAR)
     {
-      // [核心修改] VFH矩形精确视场遮挡（FOV block），不膨胀圆
+      // 1. [核心修复 A] 计算无人机到方柱的【物理真实距离】(不加 margin)
+      float phys_min_x = o.position.x() - o.width / 2.0f;
+      float phys_max_x = o.position.x() + o.width / 2.0f;
+      float phys_min_y = o.position.y() - o.length / 2.0f;
+      float phys_max_y = o.position.y() + o.length / 2.0f;
+
+      float phys_dx = std::max({phys_min_x - curr.x(), 0.0f, curr.x() - phys_max_x});
+      float phys_dy = std::max({phys_min_y - curr.y(), 0.0f, curr.y() - phys_max_y});
+      float phys_d = std::hypot(phys_dx, phys_dy);
+
+      // 用真实的物理距离来判断是否需要紧急制动
+      if (phys_d < min_obs_d)
+        min_obs_d = phys_d;
+      if (phys_d > 3.0 || phys_d < 0.05)
+        continue; // 过滤太远或雷达噪点
+
+      // 2. 计算 VFH 视场阻挡 FOV 时，依然使用【膨胀边界】，保障机体不擦碰
       float total_margin = cfg.uav_radius + cfg.safe_margin;
-      float min_x = o.position.x() - o.width / 2.0f - total_margin;
-      float max_x = o.position.x() + o.width / 2.0f + total_margin;
-      float min_y = o.position.y() - o.length / 2.0f - total_margin;
-      float max_y = o.position.y() + o.length / 2.0f + total_margin;
+      float inf_min_x = phys_min_x - total_margin;
+      float inf_max_x = phys_max_x + total_margin;
+      float inf_min_y = phys_min_y - total_margin;
+      float inf_max_y = phys_max_y + total_margin;
 
-      // 计算无人机到该膨胀后矩形框的最短距离
-      float dx = std::max({min_x - curr.x(), 0.0f, curr.x() - max_x});
-      float dy = std::max({min_y - curr.y(), 0.0f, curr.y() - max_y});
-      float d = std::hypot(dx, dy);
-
-      if (d < min_obs_d)
-        min_obs_d = d;
-      if (d > 3.0 || d < 0.1)
-        continue;
-
-      // 提取四个角，算它们针对无人机当前视角的偏差
-      Eigen::Vector2f corners[4] = {{min_x, min_y}, {min_x, max_y}, {max_x, min_y}, {max_x, max_y}};
+      Eigen::Vector2f corners[4] = {{inf_min_x, inf_min_y}, {inf_min_x, inf_max_y}, {inf_max_x, inf_min_y}, {inf_max_x, inf_max_y}};
       std::vector<float> angles;
       for (int i = 0; i < 4; ++i)
       {
@@ -618,7 +661,6 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &obs, bool
         angles.push_back(ang);
       }
 
-      // 通过寻找最大缝隙(Max Gap)解决 -PI 到 PI 的跳变问题，锁定阻挡视场的真实起点和终点
       std::sort(angles.begin(), angles.end());
       float max_gap = angles[0] + 2 * M_PI - angles[3];
       int gap_idx = 3;
@@ -636,7 +678,7 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &obs, bool
       if (gap_idx != 3)
       {
         start_ang = angles[gap_idx + 1];
-        end_ang = angles[gap_idx] + 2 * M_PI; // 将终点跨越映射为连贯的角度
+        end_ang = angles[gap_idx] + 2 * M_PI;
       }
       else
       {
@@ -644,7 +686,6 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &obs, bool
         end_ang = angles[3];
       }
 
-      // 阻塞被方柱完全覆盖的扇区直方图
       int steps = std::ceil((end_ang - start_ang) / (2 * M_PI / BINS));
       for (int k = 0; k <= steps; ++k)
       {
@@ -652,32 +693,47 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &obs, bool
         int idx = (int)((a + M_PI) / (2 * M_PI) * BINS) % BINS;
         if (idx < 0)
           idx += BINS;
-        hist[idx] += 10.0f / (d + 0.1f);
+        // 斥力基于真实距离衰减
+        hist[idx] += 10.0f / (phys_d + 0.1f);
       }
     }
     else if (o.type == WALL)
     {
-      Eigen::Vector2f to_obs = o.position - curr;
-      float d = to_obs.norm();
-      if (d < min_obs_d)
-        min_obs_d = d;
-      if (d > 3.0 || d < 0.1)
+      // 同样修复墙体的物理真实距离计算
+      float hl = o.length / 2.0f;
+      Eigen::Vector2f w_dir(cos(o.angle), sin(o.angle));
+      Eigen::Vector2f p1 = o.position - w_dir * hl;
+      Eigen::Vector2f p2 = o.position + w_dir * hl;
+
+      // 线段到无人机的几何距离 减去 墙体自身厚度
+      float phys_d = std::sqrt(dist_sq_point_to_segment(curr, p1, p2)) - o.radius;
+      if (phys_d < 0)
+        phys_d = 0;
+
+      if (phys_d < min_obs_d)
+        min_obs_d = phys_d;
+      if (phys_d > 3.0 || phys_d < 0.05)
         continue;
+
+      Eigen::Vector2f to_obs = o.position - curr;
       float angle = std::atan2(to_obs.y(), to_obs.x()) - current_yaw;
       while (angle > M_PI)
         angle -= 2 * M_PI;
       while (angle < -M_PI)
         angle += 2 * M_PI;
-      float w_ang = std::asin(std::min(1.0f, (o.radius + cfg.uav_radius + cfg.safe_margin) / d));
+
+      float w_ang = std::asin(std::min(1.0f, (o.radius + cfg.uav_radius + cfg.safe_margin) / (phys_d + 0.1f)));
       int c_idx = (int)((angle + M_PI) / (2 * M_PI) * BINS) % BINS;
       int hw = (int)(w_ang / (2 * M_PI) * BINS) + 1;
       for (int k = c_idx - hw; k <= c_idx + hw; ++k)
-        hist[(k + BINS) % BINS] += 10.0f / d;
+        hist[(k + BINS) % BINS] += 10.0f / (phys_d + 0.1f);
     }
   }
 
+  // [新增诊断输出] 如果真的触发了紧急制动，大声喊出来！
   if (min_obs_d < cfg.min_safe_dist)
   {
+    ROS_WARN_THROTTLE(1.0, "[VFH] 触发紧急制动！距物理障碍物仅 %.2fm (阈值: %.2f)", min_obs_d, cfg.min_safe_dist);
     need_replan = true;
     return false;
   }
@@ -709,7 +765,7 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &obs, bool
 
   if (best_idx == -1)
   {
-    ROS_WARN_THROTTLE(1.0, "[VFH] 局部死锁！");
+    ROS_WARN_THROTTLE(1.0, "[VFH] 局部死锁！所有方向被封死，请求重新 A*");
     need_replan = true;
     return false;
   }
@@ -726,9 +782,12 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &obs, bool
 
   pub_viz_vfh_vectors(t_yaw, final_yaw, curr);
 
+  // [运动学控制平滑] 根据转弯角度自动调节前馈速度
   float speed = std::min(cfg.max_speed, dist);
-  if (std::abs(diff) > 0.5)
-    speed *= 0.3;
+  if (std::abs(diff) > 0.8)
+    speed *= 0.2; // 遇急弯深踩刹车
+  else if (std::abs(diff) > 0.3)
+    speed *= 0.6; // 缓弯微收油门
 
   setpoint_raw.position.x = curr.x() + std::cos(final_yaw) * speed * 0.5;
   setpoint_raw.position.y = curr.y() + std::sin(final_yaw) * speed * 0.5;
