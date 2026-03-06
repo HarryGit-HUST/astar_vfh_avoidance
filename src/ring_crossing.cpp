@@ -68,7 +68,7 @@ bool RingCrossing::compute_cmd(const nav_msgs::Odometry &local_pos,
 
     // === 3. 盲穿判定 ===
     // 距离非常近(<1.5m)，或者框非常大(贴脸了)，或者丢失视野但有记忆 -> 进入冲刺模式
-    if (dist_x < 1.5 || safe_w > 400.0 || (has_gate_estimate && !is_vision_valid))
+    if ( safe_w > 400.0 || (has_gate_estimate && !is_vision_valid))
     {
         is_crossing_blind = true;
     }

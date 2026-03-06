@@ -27,6 +27,7 @@ float init_yaw_take_off        = 0;
 bool flag_init_position        = false;
 
 std::vector<Obstacle> obstacles;
+std::vector<Obstacle> static_walls;
 RingCrossing ring_ctrl;
 
 int mission_step = 0;
@@ -242,6 +243,66 @@ float distToPolygon(const Eigen::Vector2f &pt, const std::vector<Eigen::Vector2f
         if (d_sq < min_dist_sq) min_dist_sq = d_sq;
     }
     return inside ? 0.0f : std::sqrt(min_dist_sq);
+}
+void build_static_walls()
+{
+    if (!static_walls.empty())
+        return;
+
+    // 根据实机场地测量的距离，建立高精电子围栏 (以起飞点为原点)
+    // 假设机头正前方为 +X，左侧为 +Y (标准 ENU 投影)
+    float front_x = init_pos_x + 5.3f;
+    float back_x = init_pos_x - 0.5f;
+
+    // 如果实际飞行时，发现飞机以为的墙和真实相反，请互换下面两行的 +1.0 和 -7.5
+    float left_y = init_pos_y + 1.0f;
+    float right_y = init_pos_y - 7.5f;
+
+    float cx = (front_x + back_x) / 2.0f;
+    float cy = (left_y + right_y) / 2.0f;
+    float len_x = std::abs(front_x - back_x);
+    float len_y = std::abs(left_y - right_y);
+
+    float wall_thickness = 0.2f; // 给虚拟墙加点厚度，防止 VFH 越界
+
+    // 1. 前墙 (垂直于 X 轴)
+    Obstacle front_obs;
+    front_obs.type = WALL;
+    front_obs.position = Eigen::Vector2f(front_x, cy);
+    front_obs.angle = M_PI / 2.0f;
+    front_obs.length = len_y;
+    front_obs.radius = wall_thickness;
+
+    // 2. 后墙 (垂直于 X 轴)
+    Obstacle back_obs;
+    back_obs.type = WALL;
+    back_obs.position = Eigen::Vector2f(back_x, cy);
+    back_obs.angle = M_PI / 2.0f;
+    back_obs.length = len_y;
+    back_obs.radius = wall_thickness;
+
+    // 3. 左墙 (平行于 X 轴)
+    Obstacle left_obs;
+    left_obs.type = WALL;
+    left_obs.position = Eigen::Vector2f(cx, left_y);
+    left_obs.angle = 0.0f;
+    left_obs.length = len_x;
+    left_obs.radius = wall_thickness;
+
+    // 4. 右墙 (平行于 X 轴)
+    Obstacle right_obs;
+    right_obs.type = WALL;
+    right_obs.position = Eigen::Vector2f(cx, right_y);
+    right_obs.angle = 0.0f;
+    right_obs.length = len_x;
+    right_obs.radius = wall_thickness;
+
+    static_walls.push_back(front_obs);
+    static_walls.push_back(back_obs);
+    static_walls.push_back(left_obs);
+    static_walls.push_back(right_obs);
+
+    ROS_INFO("✅ 高精电子围栏已激活！边界锁死: X[%.1f, %.1f], Y[%.1f, %.1f]", back_x, front_x, right_y, left_y);
 }
 
 // ============================================================================
@@ -884,47 +945,50 @@ void pub_viz_grid_map(const OccupancyGrid2D &grid) {
 }
 
 // ============================================================================
-// 逻辑封装：执行单步避障
+// 逻辑封装：执行单步避障 (引入 all_obs)
 // ============================================================================
-bool execute_avoidance_step(Eigen::Vector2f goal) {
+bool execute_avoidance_step(Eigen::Vector2f goal, const std::vector<Obstacle> &all_obs)
+{
     Eigen::Vector2f curr(local_pos.pose.pose.position.x, local_pos.pose.pose.position.y);
-    global_grid.update_with_memory(obstacles, cfg.uav_radius, cfg.safe_margin);
 
-    static int cnt = 0;
-    if (cnt++ % 5 == 0) pub_viz_grid_map(global_grid);
+    // 注意：地图的 update_with_memory 已经挪到主循环中统一执行，彻底解决“双重衰减”Bug
 
-    bool blocked  = is_path_blocked(global_path_smooth, global_grid, cfg.check_radius_buffer);
+    bool blocked = is_path_blocked(global_path_smooth, global_grid, cfg.check_radius_buffer);
     bool cooldown = (ros::Time::now() - last_replan_time).toSec() > cfg.replan_cooldown;
 
-    if (!has_global_plan || (blocked && cooldown)) {
-        if (blocked && has_global_plan) ROS_WARN("路径被动态障碍物截断，重规划...");
-        if (run_astar(global_grid, curr, goal, global_path_raw)) {
+    if (!has_global_plan || (blocked && cooldown))
+    {
+        if (blocked && has_global_plan)
+            ROS_WARN("路径被动态障碍物截断，重规划...");
+        if (run_astar(global_grid, curr, goal, global_path_raw))
+        {
             global_path_smooth = BSplinePlanner::generate_smooth_path(global_path_raw, 10);
-            has_global_plan    = true;
-            last_replan_time   = ros::Time::now();
-            vfh_first_run      = true;
+            has_global_plan = true;
+            last_replan_time = ros::Time::now();
+            vfh_first_run = true;
             ROS_INFO("规划成功，平滑路径点: %lu", global_path_smooth.size());
         }
-        else {
+        else
+        {
             setpoint_raw.position.x = curr.x();
             setpoint_raw.position.y = curr.y();
-            has_global_plan         = false;
+            has_global_plan = false;
             return false;
         }
     }
 
-    if (has_global_plan) {
-        if (cnt % 5 == 0) {
-            pub_viz_astar_path(global_path_raw);
-            pub_viz_smooth_path(global_path_smooth);
-        }
-
+    if (has_global_plan)
+    {
         Eigen::Vector2f la = get_lookahead_point(global_path_smooth, curr, cfg.lookahead_dist);
-        bool stuck         = false;
-        bool reached       = run_vfh_plus(la, obstacles, stuck);
+        bool stuck = false;
 
-        if (stuck) has_global_plan = false;
-        if ((curr - goal).norm() < 0.3) return true;
+        // VFH 也使用合并后的障碍物，确保不会冲出虚拟墙
+        bool reached = run_vfh_plus(la, all_obs, stuck);
+
+        if (stuck)
+            has_global_plan = false;
+        if ((curr - goal).norm() < 0.3)
+            return true;
     }
     return false;
 }
@@ -1035,13 +1099,34 @@ int main(int argc, char **argv) {
     ros::Time last_req = ros::Time::now();
 
     while (ros::ok()) {
-        global_grid.update_with_memory(obstacles, cfg.uav_radius, cfg.safe_margin);
-        static int map_pub_cnt = 0;
-        if (map_pub_cnt++ % 5 == 0) pub_viz_grid_map(global_grid);
+        // -----------------------------------------------------------
+        // [新增架构]：每帧统一构建、合并、刷新，杜绝重影与双重衰减
+        // -----------------------------------------------------------
+        if (flag_init_pos && static_walls.empty())
+        {
+            build_static_walls();
+        }
+        // 合并：PCL 抓到的真实柱子 + 焊死的虚拟围墙
+        std::vector<Obstacle> all_obs = obstacles;
+        if (!static_walls.empty())
+        {
+            all_obs.insert(all_obs.end(), static_walls.begin(), static_walls.end());
+        }
 
+        global_grid.update_with_memory(all_obs, cfg.uav_radius, cfg.safe_margin);
+        static int map_pub_cnt = 0;
+        if (map_pub_cnt++ % 5 == 0)
+        {
+            pub_viz_grid_map(global_grid);
+            if (has_global_plan)
+            {
+                pub_viz_astar_path(global_path_raw);
+                pub_viz_smooth_path(global_path_smooth);
+            }
+        }
         pub_setpoint.publish(setpoint_raw);
         mission_step = (int)state;
-        float dt     = 0.05f;
+        float dt = 0.05f;
 
         switch (state) {
         case IDLE:
@@ -1088,14 +1173,15 @@ int main(int argc, char **argv) {
             break;
 
         case LEG1_AVOID:
-            if (execute_avoidance_step({init_pos_x + cfg.wp1[0], init_pos_y + cfg.wp1[1]})) {
+            if (execute_avoidance_step({init_pos_x + cfg.wp1[0], init_pos_y + cfg.wp1[1]}, all_obs))
+            {
                 state = TURN1;
                 ROS_INFO(">>> 转向右");
             }
             break;
 
         case TURN1: {
-            float target_yaw       = init_yaw_take_off + M_PI / 2.0 - M_PI / 2.0;
+            float target_yaw       = init_yaw_take_off  - M_PI / 2.0;
             setpoint_raw.yaw       = calc_smooth_yaw(target_yaw, setpoint_raw.yaw, dt);
             setpoint_raw.type_mask = 0b101111111000;
             if (get_yaw_diff(target_yaw) < 0.1) {
@@ -1131,7 +1217,7 @@ int main(int argc, char **argv) {
             break;
 
         case TURN2: {
-            float target_yaw = init_yaw_take_off + M_PI / 2.0 + M_PI;
+            float target_yaw = init_yaw_take_off  + M_PI;
             setpoint_raw.yaw = calc_smooth_yaw(target_yaw, setpoint_raw.yaw, dt);
             if (get_yaw_diff(target_yaw) < 0.1) {
                 state           = LEG3_AVOID;
@@ -1142,14 +1228,15 @@ int main(int argc, char **argv) {
         }
 
         case LEG3_AVOID:
-            if (execute_avoidance_step({init_pos_x + cfg.wp3[0], init_pos_y + cfg.wp3[1]})) {
+            if (execute_avoidance_step({init_pos_x + cfg.wp3[0], init_pos_y + cfg.wp3[1]}, all_obs))
+            {
                 state = TURN3;
                 ROS_INFO(">>> 转向右");
             }
             break;
 
         case TURN3: {
-            float target_yaw = init_yaw_take_off + M_PI / 2.0 - M_PI / 2.0;
+            float target_yaw = init_yaw_take_off - M_PI / 2.0;
             setpoint_raw.yaw = calc_smooth_yaw(target_yaw, setpoint_raw.yaw, dt);
             if (get_yaw_diff(target_yaw) < 0.1) {
                 state           = LEG4_FINAL;
@@ -1160,11 +1247,12 @@ int main(int argc, char **argv) {
         }
 
         case LEG4_FINAL:
-            if (execute_avoidance_step({init_pos_x + cfg.wp4[0], init_pos_y + cfg.wp4[1]})) {
+            if (execute_avoidance_step({init_pos_x + cfg.wp4[0], init_pos_y + cfg.wp4[1]}, all_obs))
+            {
                 state = LANDING_SEARCH;
                 ROS_INFO(">>> 降落搜索");
                 search_mode_dir = false;
-                last_req        = ros::Time::now();
+                last_req = ros::Time::now();
             }
             break;
 
@@ -1175,7 +1263,7 @@ int main(int argc, char **argv) {
             {
                 float scan_x            = init_pos_x + cfg.wp4[0];
                 float scan_y_min        = init_pos_y + 0.0;
-                float scan_y_max        = init_pos_y + 4.0;
+                float scan_y_max        = init_pos_y + 3.6;
 
                 setpoint_raw.type_mask  = 0b101111100011;  // Vx, Vy, Z, Yaw
                 setpoint_raw.velocity.x = satfunc(
