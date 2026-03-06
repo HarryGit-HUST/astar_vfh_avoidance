@@ -14,7 +14,7 @@ planner:
   yaw_smooth_weight: 0.1   # [关键] VFH角度低通滤波系数 (0.0~1.0), 越小越平滑但反应越慢
 
   # --- 避障与地图 ---
-  uav_radius: 0.1         # 无人机碰撞半径
+  uav_radius: 0.3         # 无人机碰撞半径
   safe_margin: 0.1         # 膨胀安全余量
   min_safe_dist: 0.01       # 紧急制动距离
   wall_radius: 0.10        # [关键] 墙体在地图上的物理厚度 (m)
@@ -45,4 +45,4 @@ scan_land:
   p_xy: 0.3
   vel_track_max: 0.4
   time_threshold: 3.0
-  yolo_follow_kp: -2.0
+  yolo_follow_kp: -0.5
