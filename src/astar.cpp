@@ -26,6 +26,9 @@ float init_position_z_take_off = 0;
 float init_yaw_take_off        = 0;
 bool flag_init_position        = false;
 
+ros::Time precision_land_last_time;
+bool land_done = false;
+
 std::vector<Obstacle> obstacles;
 std::vector<Obstacle> static_walls;
 RingCrossing ring_ctrl;
