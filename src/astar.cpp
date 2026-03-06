@@ -1261,28 +1261,28 @@ int main(int argc, char **argv) {
             mission_num_pub.publish(mission_num_msg);
 
             {
-                float scan_x            = init_pos_x + cfg.wp4[0];
-                float scan_y_min        = init_pos_y + 0.0;
-                float scan_y_max        = init_pos_y + 3.6;
+                float scan_y            = init_pos_y + cfg.wp4[1];
+                float scan_x_min        = init_pos_x + 0.0;
+                float scan_x_max        = init_pos_x + 3.6;
 
                 setpoint_raw.type_mask  = 0b101111100011;  // Vx, Vy, Z, Yaw
                 setpoint_raw.velocity.x = satfunc(
-                    (scan_x - local_pos.pose.pose.position.x) * cfg.p_xy, cfg.vel_track_max);
+                    (scan_y - local_pos.pose.pose.position.y) * cfg.p_xy, cfg.vel_track_max);
                 setpoint_raw.position.z = init_pos_z + cfg.takeoff_height;
-                setpoint_raw.yaw        = init_yaw_take_off;
+                setpoint_raw.yaw = init_yaw_take_off;
 
                 if (!search_mode_dir) {
-                    setpoint_raw.velocity.y =
-                        satfunc((scan_y_max - local_pos.pose.pose.position.y) * cfg.p_xy,
+                    setpoint_raw.velocity.x =
+                        satfunc((scan_x_max - local_pos.pose.pose.position.x) * cfg.p_xy,
                                 cfg.vel_track_max);
-                    if (std::abs(local_pos.pose.pose.position.y - scan_y_max) < 0.3)
+                    if (std::abs(local_pos.pose.pose.position.x - scan_x_max) < 0.3)
                         search_mode_dir = true;
                 }
                 else {
-                    setpoint_raw.velocity.y =
-                        satfunc((scan_y_min - local_pos.pose.pose.position.y) * cfg.p_xy,
+                    setpoint_raw.velocity.x =
+                        satfunc((scan_x_min - local_pos.pose.pose.position.x) * cfg.p_xy,
                                 cfg.vel_track_max);
-                    if (std::abs(local_pos.pose.pose.position.y - scan_y_min) < 0.3)
+                    if (std::abs(local_pos.pose.pose.position.x - scan_x_min) < 0.3)
                         search_mode_dir = false;
                 }
             }
@@ -1315,8 +1315,8 @@ int main(int argc, char **argv) {
                 float vx = satfunc(yolo_result.point.y * cfg.yolo_follow_kp, cfg.vel_track_max);
                 float vy = satfunc(yolo_result.point.x * cfg.yolo_follow_kp, cfg.vel_track_max);
                 setpoint_raw.type_mask  = 0b100111000011;
-                setpoint_raw.velocity.x = vy;
-                setpoint_raw.velocity.y = vx;
+                setpoint_raw.velocity.x = vx;
+                setpoint_raw.velocity.y = vy;
                 if (!flag) {
                     setpoint_raw.position.z = init_pos_z + cfg.takeoff_height;
                 }
