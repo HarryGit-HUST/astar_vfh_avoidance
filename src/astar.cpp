@@ -786,7 +786,7 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &obs, bool
             }
             // [核心修复] 软硬结合的斥力场，彻底防撞！
             // 如果物理距离小于 (机身半径 + 膨胀 + 0.2米急刹缓冲)，赋予毁灭性代价 1000.0
-            float safe_threshold = cfg.uav_radius;
+            float safe_threshold = cfg.uav_radius+cfg.safe_margin -0.1f;
             float raw_cost       = (phys_d < safe_threshold) ? 1000.0f : (10.0f / (phys_d + 0.1f));
             int steps            = std::ceil((end_ang - start_ang) / (2 * M_PI / BINS));
             for (int k = 0; k <= steps; ++k) {
@@ -829,7 +829,7 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &obs, bool
         while (diff_last < -M_PI) diff_last += 2 * M_PI;
 
         // 代价 = 偏离目标点的代价 + 障碍物斥力 + 偏离上一次方向的代价(防抖)
-        float c = std::abs(diff_target) + hist[i] * 0.1f + std::abs(diff_last) * 0.5f;
+        float c = std::abs(diff_target) + hist[i] * 0.3f + std::abs(diff_last) * 0.3f;
 
         if (c < min_c) {
             min_c    = c;
@@ -856,9 +856,9 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &obs, bool
 
     float speed = std::min(cfg.max_speed, dist);
     if (std::abs(diff) > 0.8)
-        speed *= 0.2;  // 遇急弯深踩刹车
+        speed *= 0.1;  // 遇急弯深踩刹车
     else if (std::abs(diff) > 0.3)
-        speed *= 0.6;  // 缓弯微收油门
+        speed *= 0.5;  // 缓弯微收油门
 
     setpoint_raw.position.x = curr.x() + std::cos(final_yaw) * speed * 0.5;
     setpoint_raw.position.y = curr.y() + std::sin(final_yaw) * speed * 0.5;
