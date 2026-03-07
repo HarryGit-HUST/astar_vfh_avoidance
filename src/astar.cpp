@@ -425,6 +425,7 @@ void OccupancyGrid2D::update_with_memory(const std::vector<Obstacle> &obstacles,
     if (is_fast_turning) {
         ROS_WARN_THROTTLE(2.0, "[A* 建图警告] 无人机角速度过大 (%.2f)，为防重影已暂停建图！",
                           current_yaw_rate);
+        return;
     }
 
     // 地图记忆衰减逻辑 (保持不变)
@@ -773,8 +774,7 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &obs, bool
                 angles.push_back(ang);
             }
 
-            float margin_angle =
-                std::asin(std::min(1.0f, (cfg.uav_radius + cfg.safe_margin) / (phys_d + 0.1f)));
+            float margin_angle = std::asin(std::min(0.85f, (cfg.uav_radius + cfg.safe_margin) / (phys_d + 0.1f)));
 
             std::sort(angles.begin(), angles.end());
             float max_gap = angles[0] + 2 * M_PI - angles.back();
@@ -800,7 +800,10 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &obs, bool
                 start_ang = angles[0] - margin_angle;
                 end_ang = angles.back() + margin_angle;
             }
-
+            // [核心修复] 软硬结合的斥力场，彻底防撞！
+            // 如果物理距离小于 (机身半径 + 膨胀 + 0.2米急刹缓冲)，赋予毁灭性代价 1000.0
+            float safe_threshold = cfg.uav_radius ;
+            float raw_cost = (phys_d < safe_threshold) ? 1000.0f : (10.0f / (phys_d + 0.1f));
             int steps = std::ceil((end_ang - start_ang) / (2 * M_PI / BINS));
             for (int k = 0; k <= steps; ++k)
             {
@@ -808,7 +811,9 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &obs, bool
                 int idx = (int)((a + M_PI) / (2 * M_PI) * BINS) % BINS;
                 if (idx < 0)
                     idx += BINS;
-                hist[idx] += 10.0f / (phys_d + 0.1f);
+
+                // 取最大代价，防止多障碍物重叠时累加引发误判
+                hist[idx] = std::max(hist[idx], raw_cost);
             }
         }
     }
@@ -831,7 +836,7 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &obs, bool
     float min_c = 1e9;
     for (int i = 0; i < BINS; ++i)
     {
-        if (hist[i] > 15.0)
+        if (hist[i] > 100.0f)
             continue; // 斥力太大，此路不通
 
         float b_yaw = -M_PI + i * (2 * M_PI / BINS) + (M_PI / BINS) * 0.5f;
