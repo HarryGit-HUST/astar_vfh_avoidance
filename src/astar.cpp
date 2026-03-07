@@ -28,6 +28,7 @@ bool flag_init_position        = false;
 
 ros::Time precision_land_last_time;
 bool land_done = false;
+bool flag = false;
 
 std::vector<Obstacle> obstacles;
 std::vector<Obstacle> static_walls;
@@ -1403,7 +1404,7 @@ int main(int argc, char **argv) {
             break;
 
         case LANDING_FOLLOW: {
-            bool flag = false;
+            
             if (flag) {
                 setpoint_raw.position.z = local_pos.pose.pose.position.z - 0.15;
                 if (local_pos.pose.pose.position.z < init_pos_z + 0.15) {
