@@ -91,7 +91,7 @@ void land_detected_cb(const std_msgs::Bool::ConstPtr &msg);
 // 可视化
 void pub_viz_astar_path(const std::vector<Eigen::Vector2f> &path);
 void pub_viz_smooth_path(const std::vector<Eigen::Vector2f> &path);
-void pub_viz_vfh_vectors(float target_yaw, float selected_yaw, const Eigen::Vector2f &pos);
+void pub_viz_vfh_vectors(float target_yaw, float selected_yaw, const Eigen::Vector2f &pos, float hist[72]);
 void pub_viz_grid_map(const OccupancyGrid2D &grid);
 
 // 规划算法

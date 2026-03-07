@@ -709,6 +709,9 @@ Eigen::Vector2f get_lookahead_point(const std::vector<Eigen::Vector2f> &path,
     return path.back();
 }
 
+// ============================================================================
+// 修复后：VFH+ 局部避障 (剥离静态墙，只躲动态方柱)
+// ============================================================================
 bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &obs, bool &need_replan)
 {
     need_replan = false;
@@ -726,11 +729,13 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &obs, bool
 
     const int BINS = 72;
     float hist[BINS] = {0};
-    float min_obs_d = 1e9; // 仅记录无人机到物体的【物理真实距离】
+    float min_obs_d = 1e9; // 仅记录无人机到动态物体的物理距离
 
     for (const auto &o : obs)
     {
-        if (o.type == RING)
+        // [核心修改 1]：彻底无视静态墙 (WALL) 和环门 (RING)
+        // 静态墙由 A* 保证不撞，VFH 卸下包袱，专心躲避动态方柱
+        if (o.type == RING || o.type == WALL)
             continue;
 
         if (o.type == PILLAR)
@@ -739,9 +744,18 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &obs, bool
                 continue;
 
             float phys_d = distToPolygon(curr, o.footprint);
+
+            // [核心修改 2]：彻底修复“视网膜盲区” Bug！
+            // 以前小于 0.1m 直接 continue，导致撞脸的障碍物隐身。
+            // 现在限制极小值防止除以0，绝不让障碍物隐身！
+            if (phys_d < 0.01f)
+                phys_d = 0.01f;
+
             if (phys_d < min_obs_d)
                 min_obs_d = phys_d;
-            if (phys_d > 3.0 || phys_d < 0.05)
+
+            // 如果距离大于 3 米，VFH 不关心
+            if (phys_d > 3.0f)
                 continue;
 
             std::vector<float> angles;
@@ -793,42 +807,11 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &obs, bool
                 hist[idx] += 10.0f / (phys_d + 0.1f);
             }
         }
-        else if (o.type == WALL)
-        {
-            float hl = o.length / 2.0f;
-            Eigen::Vector2f w_dir(cos(o.angle), sin(o.angle));
-            Eigen::Vector2f p1 = o.position - w_dir * hl;
-            Eigen::Vector2f p2 = o.position + w_dir * hl;
-
-            float phys_d = std::sqrt(dist_sq_point_to_segment(curr, p1, p2)) - o.radius;
-            if (phys_d < 0)
-                phys_d = 0;
-
-            if (phys_d < min_obs_d)
-                min_obs_d = phys_d;
-            if (phys_d > 3.0 || phys_d < 0.05)
-                continue;
-
-            Eigen::Vector2f to_obs = o.position - curr;
-            float angle = std::atan2(to_obs.y(), to_obs.x()) - current_yaw;
-            while (angle > M_PI)
-                angle -= 2 * M_PI;
-            while (angle < -M_PI)
-                angle += 2 * M_PI;
-
-            float w_ang = std::asin(
-                std::min(1.0f, (o.radius + cfg.uav_radius + cfg.safe_margin) / (phys_d + 0.1f)));
-            int c_idx = (int)((angle + M_PI) / (2 * M_PI) * BINS) % BINS;
-            int hw = (int)(w_ang / (2 * M_PI) * BINS) + 1;
-            for (int k = c_idx - hw; k <= c_idx + hw; ++k)
-                hist[(k + BINS) % BINS] += 10.0f / (phys_d + 0.1f);
-        }
     }
 
     if (min_obs_d < cfg.min_safe_dist)
     {
-        ROS_WARN_THROTTLE(1.0, "[VFH 紧急制动] 距物理障碍物仅 %.2fm (阈值: %.2f)", min_obs_d,
-                          cfg.min_safe_dist);
+        ROS_WARN_THROTTLE(1.0, "[VFH 紧急制动] 距动态障碍物仅 %.2fm (阈值: %.2f)", min_obs_d, cfg.min_safe_dist);
         need_replan = true;
         return false;
     }
@@ -845,10 +828,11 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &obs, bool
     for (int i = 0; i < BINS; ++i)
     {
         if (hist[i] > 15.0)
-            continue;
+            continue; // 斥力太大，此路不通
+
         float b_yaw = -M_PI + i * (2 * M_PI / BINS) + (M_PI / BINS) * 0.5f;
 
-        // [核心修复] 必须先限制在 -PI 到 PI，然后再取绝对值！
+        // 完美角度差计算 (修复了绝对值倒置 Bug)
         float diff_target = b_yaw - rel_t_yaw;
         while (diff_target > M_PI)
             diff_target -= 2 * M_PI;
@@ -861,7 +845,7 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &obs, bool
         while (diff_last < -M_PI)
             diff_last += 2 * M_PI;
 
-        // 计算正确的代价函数
+        // 代价 = 偏离目标点的代价 + 障碍物斥力 + 偏离上一次方向的代价(防抖)
         float c = std::abs(diff_target) + hist[i] * 0.1f + std::abs(diff_last) * 0.5f;
 
         if (c < min_c)
@@ -888,7 +872,8 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &obs, bool
     float final_yaw = last_vfh_yaw + diff * cfg.yaw_smooth_weight;
     last_vfh_yaw = final_yaw;
 
-    pub_viz_vfh_vectors(t_yaw, final_yaw, curr);
+    // [新增] 传入 hist 给 RViz 渲染 VFH 的雷达视场
+    pub_viz_vfh_vectors(t_yaw, final_yaw, curr, hist);
 
     float speed = std::min(cfg.max_speed, dist);
     if (std::abs(diff) > 0.8)
@@ -901,6 +886,95 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &obs, bool
     setpoint_raw.position.z = init_pos_z + cfg.takeoff_height;
     setpoint_raw.yaw = final_yaw;
     return false;
+}
+
+// ============================================================================
+// 可视化强化：将 VFH 内部的想法画成 72 根扫描射线
+// ============================================================================
+void pub_viz_vfh_vectors(float t_yaw, float s_yaw, const Eigen::Vector2f &pos, float hist[72])
+{
+    // 1. 画红箭头 (A*引导的目标方向)
+    visualization_msgs::Marker m;
+    m.header.frame_id = "map";
+    m.ns = "vfh_arrows";
+    m.id = 0;
+    m.type = visualization_msgs::Marker::ARROW;
+    m.action = visualization_msgs::Marker::ADD;
+    m.pose.position.x = pos.x();
+    m.pose.position.y = pos.y();
+    m.pose.position.z = init_pos_z + cfg.takeoff_height;
+    m.scale.x = 1.0;
+    m.scale.y = 0.05;
+    m.scale.z = 0.05;
+    m.pose.orientation.w = 1;
+    m.color.r = 1.0;
+    m.color.a = 1.0;
+    tf::quaternionTFToMsg(tf::createQuaternionFromYaw(t_yaw), m.pose.orientation);
+    pub_viz_vfh.publish(m);
+
+    // 2. 画绿箭头 (VFH实际选择的无阻挡方向)
+    m.id = 1;
+    m.color.r = 0.0;
+    m.color.g = 1.0;
+    m.color.b = 0.0;
+    tf::quaternionTFToMsg(tf::createQuaternionFromYaw(s_yaw), m.pose.orientation);
+    pub_viz_vfh.publish(m);
+
+    // 3. 画 VFH 内部视场雷达 (72根射线展示障碍物斥力分布)
+    visualization_msgs::Marker hist_msg;
+    hist_msg.header.frame_id = "map";
+    hist_msg.header.stamp = ros::Time::now();
+    hist_msg.ns = "vfh_histogram";
+    hist_msg.id = 2;
+    hist_msg.type = visualization_msgs::Marker::LINE_LIST;
+    hist_msg.action = visualization_msgs::Marker::ADD;
+    hist_msg.scale.x = 0.02; // 线宽
+    hist_msg.pose.orientation.w = 1.0;
+
+    for (int i = 0; i < 72; ++i)
+    {
+        float b_yaw = -M_PI + i * (2 * M_PI / 72) + (M_PI / 72) * 0.5f;
+        float abs_yaw = b_yaw + current_yaw;
+
+        geometry_msgs::Point p1, p2;
+        p1.x = pos.x();
+        p1.y = pos.y();
+        p1.z = init_pos_z + cfg.takeoff_height;
+
+        // 射线长度代表代价大小 (最长画 1.5 米)
+        float cost_len = hist[i] * 0.1f;
+        if (cost_len < 0.2f)
+            cost_len = 0.2f; // 空旷地带画个短线示意
+        if (cost_len > 1.5f)
+            cost_len = 1.5f;
+
+        p2.x = pos.x() + std::cos(abs_yaw) * cost_len;
+        p2.y = pos.y() + std::sin(abs_yaw) * cost_len;
+        p2.z = p1.z;
+
+        hist_msg.points.push_back(p1);
+        hist_msg.points.push_back(p2);
+
+        std_msgs::ColorRGBA color;
+        color.a = 0.8;
+        if (hist[i] > 15.0f)
+        {
+            // 被阻挡的死路：画红色长线
+            color.r = 1.0;
+            color.g = 0.0;
+            color.b = 0.0;
+        }
+        else
+        {
+            // 安全可走的路：画青色短线
+            color.r = 0.0;
+            color.g = 1.0;
+            color.b = 1.0;
+        }
+        hist_msg.colors.push_back(color);
+        hist_msg.colors.push_back(color);
+    }
+    pub_viz_vfh.publish(hist_msg);
 }
 
 void pub_viz_astar_path(const std::vector<Eigen::Vector2f> &path) {
@@ -943,30 +1017,7 @@ void pub_viz_smooth_path(const std::vector<Eigen::Vector2f> &path) {
     }
     pub_viz_path_smooth.publish(ma);
 }
-void pub_viz_vfh_vectors(float t_yaw, float s_yaw, const Eigen::Vector2f &pos) {
-    visualization_msgs::Marker m;
-    m.header.frame_id    = "map";
-    m.ns                 = "vfh";
-    m.id                 = 0;
-    m.type               = 0;
-    m.action             = 0;
-    m.pose.position.x    = pos.x();
-    m.pose.position.y    = pos.y();
-    m.pose.position.z    = init_pos_z + cfg.takeoff_height;
-    m.scale.x            = 1.0;
-    m.scale.y            = 0.05;
-    m.scale.z            = 0.05;
-    m.pose.orientation.w = 1;
-    m.color.r            = 1;
-    m.color.a            = 1;
-    tf::quaternionTFToMsg(tf::createQuaternionFromYaw(t_yaw), m.pose.orientation);
-    pub_viz_vfh.publish(m);
-    m.id      = 1;
-    m.color.r = 0;
-    m.color.g = 1;
-    tf::quaternionTFToMsg(tf::createQuaternionFromYaw(s_yaw), m.pose.orientation);
-    pub_viz_vfh.publish(m);
-}
+
 void pub_viz_grid_map(const OccupancyGrid2D &grid) {
     nav_msgs::OccupancyGrid msg;
     msg.header.stamp              = ros::Time::now();
