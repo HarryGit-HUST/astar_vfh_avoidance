@@ -425,6 +425,7 @@ void OccupancyGrid2D::update_with_memory(const std::vector<Obstacle> &obstacles,
         ROS_WARN_THROTTLE(2.0, "[A* 建图警告] 无人机角速度过大 (%.2f)，为防重影已暂停建图！",
                           current_yaw_rate);
         return;
+        return;
     }
 
     // 地图记忆衰减逻辑 (保持不变)
