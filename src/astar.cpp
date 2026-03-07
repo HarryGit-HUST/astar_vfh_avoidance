@@ -28,7 +28,7 @@ bool flag_init_position        = false;
 
 ros::Time precision_land_last_time;
 bool land_done = false;
-bool flag = false;
+bool flag      = false;
 
 std::vector<Obstacle> obstacles;
 std::vector<Obstacle> static_walls;
@@ -248,65 +248,64 @@ float distToPolygon(const Eigen::Vector2f &pt, const std::vector<Eigen::Vector2f
     }
     return inside ? 0.0f : std::sqrt(min_dist_sq);
 }
-void build_static_walls()
-{
-    if (!static_walls.empty())
-        return;
+void build_static_walls() {
+    if (!static_walls.empty()) return;
 
     // 根据实机场地测量的距离，建立高精电子围栏 (以起飞点为原点)
     // 假设机头正前方为 +X，左侧为 +Y (标准 ENU 投影)
-    float front_x = init_pos_x + 5.3f;
-    float back_x = init_pos_x - 0.5f;
+    float front_x        = init_pos_x + 5.3f;
+    float back_x         = init_pos_x - 0.5f;
 
     // 如果实际飞行时，发现飞机以为的墙和真实相反，请互换下面两行的 +1.0 和 -7.5
-    float left_y = init_pos_y + 1.0f;
-    float right_y = init_pos_y - 7.5f;
+    float left_y         = init_pos_y + 1.0f;
+    float right_y        = init_pos_y - 7.5f;
 
-    float cx = (front_x + back_x) / 2.0f;
-    float cy = (left_y + right_y) / 2.0f;
-    float len_x = std::abs(front_x - back_x);
-    float len_y = std::abs(left_y - right_y);
+    float cx             = (front_x + back_x) / 2.0f;
+    float cy             = (left_y + right_y) / 2.0f;
+    float len_x          = std::abs(front_x - back_x);
+    float len_y          = std::abs(left_y - right_y);
 
-    float wall_thickness = 0.2f; // 给虚拟墙加点厚度，防止 VFH 越界
+    float wall_thickness = 0.2f;  // 给虚拟墙加点厚度，防止 VFH 越界
 
     // 1. 前墙 (垂直于 X 轴)
     Obstacle front_obs;
-    front_obs.type = WALL;
+    front_obs.type     = WALL;
     front_obs.position = Eigen::Vector2f(front_x, cy);
-    front_obs.angle = M_PI / 2.0f;
-    front_obs.length = len_y;
-    front_obs.radius = wall_thickness;
+    front_obs.angle    = M_PI / 2.0f;
+    front_obs.length   = len_y;
+    front_obs.radius   = wall_thickness;
 
     // 2. 后墙 (垂直于 X 轴)
     Obstacle back_obs;
-    back_obs.type = WALL;
+    back_obs.type     = WALL;
     back_obs.position = Eigen::Vector2f(back_x, cy);
-    back_obs.angle = M_PI / 2.0f;
-    back_obs.length = len_y;
-    back_obs.radius = wall_thickness;
+    back_obs.angle    = M_PI / 2.0f;
+    back_obs.length   = len_y;
+    back_obs.radius   = wall_thickness;
 
     // 3. 左墙 (平行于 X 轴)
     Obstacle left_obs;
-    left_obs.type = WALL;
+    left_obs.type     = WALL;
     left_obs.position = Eigen::Vector2f(cx, left_y);
-    left_obs.angle = 0.0f;
-    left_obs.length = len_x;
-    left_obs.radius = wall_thickness;
+    left_obs.angle    = 0.0f;
+    left_obs.length   = len_x;
+    left_obs.radius   = wall_thickness;
 
     // 4. 右墙 (平行于 X 轴)
     Obstacle right_obs;
-    right_obs.type = WALL;
+    right_obs.type     = WALL;
     right_obs.position = Eigen::Vector2f(cx, right_y);
-    right_obs.angle = 0.0f;
-    right_obs.length = len_x;
-    right_obs.radius = wall_thickness;
+    right_obs.angle    = 0.0f;
+    right_obs.length   = len_x;
+    right_obs.radius   = wall_thickness;
 
     static_walls.push_back(front_obs);
     static_walls.push_back(back_obs);
     static_walls.push_back(left_obs);
     static_walls.push_back(right_obs);
 
-    ROS_INFO("✅ 高精电子围栏已激活！边界锁死: X[%.1f, %.1f], Y[%.1f, %.1f]", back_x, front_x, right_y, left_y);
+    ROS_INFO("✅ 高精电子围栏已激活！边界锁死: X[%.1f, %.1f], Y[%.1f, %.1f]", back_x, front_x,
+             right_y, left_y);
 }
 
 // ============================================================================
@@ -425,6 +424,7 @@ void OccupancyGrid2D::update_with_memory(const std::vector<Obstacle> &obstacles,
     if (is_fast_turning) {
         ROS_WARN_THROTTLE(2.0, "[A* 建图警告] 无人机角速度过大 (%.2f)，为防重影已暂停建图！",
                           current_yaw_rate);
+        return;
     }
 
     // 地图记忆衰减逻辑 (保持不变)
@@ -716,208 +716,181 @@ Eigen::Vector2f get_lookahead_point(const std::vector<Eigen::Vector2f> &path,
 // ============================================================================
 // 修复后：VFH+ 局部避障 (剥离静态墙，只躲动态方柱)
 // ============================================================================
-bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &obs, bool &need_replan)
-{
+bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &obs, bool &need_replan) {
     need_replan = false;
     Eigen::Vector2f curr(local_pos.pose.pose.position.x, local_pos.pose.pose.position.y);
     Eigen::Vector2f dir = target - curr;
-    float dist = dir.norm();
-    if (dist < 0.2)
-        return true;
+    float dist          = dir.norm();
+    if (dist < 0.2) return true;
 
-    if (vfh_first_run)
-    {
-        last_vfh_yaw = current_yaw;
+    if (vfh_first_run) {
+        last_vfh_yaw  = current_yaw;
         vfh_first_run = false;
     }
 
-    const int BINS = 72;
+    const int BINS   = 72;
     float hist[BINS] = {0};
-    float min_obs_d = 1e9; // 仅记录无人机到动态物体的物理距离
+    float min_obs_d  = 1e9;  // 仅记录无人机到动态物体的物理距离
 
-    for (const auto &o : obs)
-    {
+    for (const auto &o : obs) {
         // [核心修改 1]：彻底无视静态墙 (WALL) 和环门 (RING)
         // 静态墙由 A* 保证不撞，VFH 卸下包袱，专心躲避动态方柱
-        if (o.type == RING || o.type == WALL)
-            continue;
+        if (o.type == RING || o.type == WALL) continue;
 
-        if (o.type == PILLAR)
-        {
-            if (o.footprint.empty())
-                continue;
+        if (o.type == PILLAR) {
+            if (o.footprint.empty()) continue;
 
             float phys_d = distToPolygon(curr, o.footprint);
 
             // [核心修改 2]：彻底修复“视网膜盲区” Bug！
             // 以前小于 0.1m 直接 continue，导致撞脸的障碍物隐身。
             // 现在限制极小值防止除以0，绝不让障碍物隐身！
-            if (phys_d < 0.01f)
-                phys_d = 0.01f;
+            if (phys_d < 0.01f) phys_d = 0.01f;
 
-            if (phys_d < min_obs_d)
-                min_obs_d = phys_d;
+            if (phys_d < min_obs_d) min_obs_d = phys_d;
 
             // 如果距离大于 3 米，VFH 不关心
-            if (phys_d > 3.0f)
-                continue;
+            if (phys_d > 3.0f) continue;
 
             std::vector<float> angles;
-            for (const auto &pt : o.footprint)
-            {
+            for (const auto &pt : o.footprint) {
                 float ang = std::atan2(pt.y() - curr.y(), pt.x() - curr.x()) - current_yaw;
-                while (ang > M_PI)
-                    ang -= 2 * M_PI;
-                while (ang < -M_PI)
-                    ang += 2 * M_PI;
+                while (ang > M_PI) ang -= 2 * M_PI;
+                while (ang < -M_PI) ang += 2 * M_PI;
                 angles.push_back(ang);
             }
 
             float margin_angle =
-                std::asin(std::min(1.0f, (cfg.uav_radius + cfg.safe_margin) / (phys_d + 0.1f)));
+                std::asin(std::min(0.85f, (cfg.uav_radius + cfg.safe_margin) / (phys_d + 0.1f)));
 
             std::sort(angles.begin(), angles.end());
             float max_gap = angles[0] + 2 * M_PI - angles.back();
-            int gap_idx = angles.size() - 1;
-            for (size_t i = 0; i < angles.size() - 1; ++i)
-            {
+            int gap_idx   = angles.size() - 1;
+            for (size_t i = 0; i < angles.size() - 1; ++i) {
                 float gap = angles[i + 1] - angles[i];
-                if (gap > max_gap)
-                {
+                if (gap > max_gap) {
                     max_gap = gap;
                     gap_idx = i;
                 }
             }
 
             float start_ang, end_ang;
-            if (gap_idx != angles.size() - 1)
-            {
+            if (gap_idx != angles.size() - 1) {
                 start_ang = angles[gap_idx + 1] - margin_angle;
-                end_ang = angles[gap_idx] + 2 * M_PI + margin_angle;
+                end_ang   = angles[gap_idx] + 2 * M_PI + margin_angle;
             }
-            else
-            {
+            else {
                 start_ang = angles[0] - margin_angle;
-                end_ang = angles.back() + margin_angle;
+                end_ang   = angles.back() + margin_angle;
             }
-
-            int steps = std::ceil((end_ang - start_ang) / (2 * M_PI / BINS));
-            for (int k = 0; k <= steps; ++k)
-            {
+            // [核心修复] 软硬结合的斥力场，彻底防撞！
+            // 如果物理距离小于 (机身半径 + 膨胀 + 0.2米急刹缓冲)，赋予毁灭性代价 1000.0
+            float safe_threshold = cfg.uav_radius;
+            float raw_cost       = (phys_d < safe_threshold) ? 1000.0f : (10.0f / (phys_d + 0.1f));
+            int steps            = std::ceil((end_ang - start_ang) / (2 * M_PI / BINS));
+            for (int k = 0; k <= steps; ++k) {
                 float a = start_ang + k * (2 * M_PI / BINS);
                 int idx = (int)((a + M_PI) / (2 * M_PI) * BINS) % BINS;
-                if (idx < 0)
-                    idx += BINS;
-                hist[idx] += 10.0f / (phys_d + 0.1f);
+                if (idx < 0) idx += BINS;
+
+                // 取最大代价，防止多障碍物重叠时累加引发误判
+                hist[idx] = std::max(hist[idx], raw_cost);
             }
         }
     }
 
-    if (min_obs_d < cfg.min_safe_dist)
-    {
-        ROS_WARN_THROTTLE(1.0, "[VFH 紧急制动] 距动态障碍物仅 %.2fm (阈值: %.2f)", min_obs_d, cfg.min_safe_dist);
+    if (min_obs_d < cfg.min_safe_dist) {
+        ROS_WARN_THROTTLE(1.0, "[VFH 紧急制动] 距动态障碍物仅 %.2fm (阈值: %.2f)", min_obs_d,
+                          cfg.min_safe_dist);
         need_replan = true;
         return false;
     }
 
-    float t_yaw = std::atan2(dir.y(), dir.x());
+    float t_yaw     = std::atan2(dir.y(), dir.x());
     float rel_t_yaw = t_yaw - current_yaw;
-    while (rel_t_yaw > M_PI)
-        rel_t_yaw -= 2 * M_PI;
-    while (rel_t_yaw < -M_PI)
-        rel_t_yaw += 2 * M_PI;
+    while (rel_t_yaw > M_PI) rel_t_yaw -= 2 * M_PI;
+    while (rel_t_yaw < -M_PI) rel_t_yaw += 2 * M_PI;
 
     int best_idx = -1;
-    float min_c = 1e9;
-    for (int i = 0; i < BINS; ++i)
-    {
-        if (hist[i] > 15.0)
-            continue; // 斥力太大，此路不通
+    float min_c  = 1e9;
+    for (int i = 0; i < BINS; ++i) {
+        if (hist[i] > 100.0f) continue;  // 斥力太大，此路不通
 
-        float b_yaw = -M_PI + i * (2 * M_PI / BINS) + (M_PI / BINS) * 0.5f;
+        float b_yaw       = -M_PI + i * (2 * M_PI / BINS) + (M_PI / BINS) * 0.5f;
 
         // 完美角度差计算 (修复了绝对值倒置 Bug)
         float diff_target = b_yaw - rel_t_yaw;
-        while (diff_target > M_PI)
-            diff_target -= 2 * M_PI;
-        while (diff_target < -M_PI)
-            diff_target += 2 * M_PI;
+        while (diff_target > M_PI) diff_target -= 2 * M_PI;
+        while (diff_target < -M_PI) diff_target += 2 * M_PI;
 
         float diff_last = b_yaw - (last_vfh_yaw - current_yaw);
-        while (diff_last > M_PI)
-            diff_last -= 2 * M_PI;
-        while (diff_last < -M_PI)
-            diff_last += 2 * M_PI;
+        while (diff_last > M_PI) diff_last -= 2 * M_PI;
+        while (diff_last < -M_PI) diff_last += 2 * M_PI;
 
         // 代价 = 偏离目标点的代价 + 障碍物斥力 + 偏离上一次方向的代价(防抖)
         float c = std::abs(diff_target) + hist[i] * 0.1f + std::abs(diff_last) * 0.5f;
 
-        if (c < min_c)
-        {
-            min_c = c;
+        if (c < min_c) {
+            min_c    = c;
             best_idx = i;
         }
     }
 
-    if (best_idx == -1)
-    {
+    if (best_idx == -1) {
         ROS_WARN_THROTTLE(1.0, "[VFH 死锁] 所有方向被封死，请求重新 A*");
         need_replan = true;
         return false;
     }
 
     float selected_yaw = -M_PI + best_idx * (2 * M_PI / BINS) + (M_PI / BINS) * 0.5f + current_yaw;
-    float diff = selected_yaw - last_vfh_yaw;
-    while (diff > M_PI)
-        diff -= 2 * M_PI;
-    while (diff < -M_PI)
-        diff += 2 * M_PI;
+    float diff         = selected_yaw - last_vfh_yaw;
+    while (diff > M_PI) diff -= 2 * M_PI;
+    while (diff < -M_PI) diff += 2 * M_PI;
 
     float final_yaw = last_vfh_yaw + diff * cfg.yaw_smooth_weight;
-    last_vfh_yaw = final_yaw;
+    last_vfh_yaw    = final_yaw;
 
     // [新增] 传入 hist 给 RViz 渲染 VFH 的雷达视场
     pub_viz_vfh_vectors(t_yaw, final_yaw, curr, hist);
 
     float speed = std::min(cfg.max_speed, dist);
     if (std::abs(diff) > 0.8)
-        speed *= 0.2; // 遇急弯深踩刹车
+        speed *= 0.2;  // 遇急弯深踩刹车
     else if (std::abs(diff) > 0.3)
-        speed *= 0.6; // 缓弯微收油门
+        speed *= 0.6;  // 缓弯微收油门
 
     setpoint_raw.position.x = curr.x() + std::cos(final_yaw) * speed * 0.5;
     setpoint_raw.position.y = curr.y() + std::sin(final_yaw) * speed * 0.5;
     setpoint_raw.position.z = init_pos_z + cfg.takeoff_height;
-    setpoint_raw.yaw = final_yaw;
+    setpoint_raw.yaw        = final_yaw;
     return false;
 }
 
 // ============================================================================
 // 可视化强化：将 VFH 内部的想法画成 72 根扫描射线
 // ============================================================================
-void pub_viz_vfh_vectors(float t_yaw, float s_yaw, const Eigen::Vector2f &pos, float hist[72])
-{
+void pub_viz_vfh_vectors(float t_yaw, float s_yaw, const Eigen::Vector2f &pos, float hist[72]) {
     // 1. 画红箭头 (A*引导的目标方向)
     visualization_msgs::Marker m;
-    m.header.frame_id = "map";
-    m.ns = "vfh_arrows";
-    m.id = 0;
-    m.type = visualization_msgs::Marker::ARROW;
-    m.action = visualization_msgs::Marker::ADD;
-    m.pose.position.x = pos.x();
-    m.pose.position.y = pos.y();
-    m.pose.position.z = init_pos_z + cfg.takeoff_height;
-    m.scale.x = 1.0;
-    m.scale.y = 0.05;
-    m.scale.z = 0.05;
+    m.header.frame_id    = "map";
+    m.ns                 = "vfh_arrows";
+    m.id                 = 0;
+    m.type               = visualization_msgs::Marker::ARROW;
+    m.action             = visualization_msgs::Marker::ADD;
+    m.pose.position.x    = pos.x();
+    m.pose.position.y    = pos.y();
+    m.pose.position.z    = init_pos_z + cfg.takeoff_height;
+    m.scale.x            = 1.0;
+    m.scale.y            = 0.05;
+    m.scale.z            = 0.05;
     m.pose.orientation.w = 1;
-    m.color.r = 1.0;
-    m.color.a = 1.0;
+    m.color.r            = 1.0;
+    m.color.a            = 1.0;
     tf::quaternionTFToMsg(tf::createQuaternionFromYaw(t_yaw), m.pose.orientation);
     pub_viz_vfh.publish(m);
 
     // 2. 画绿箭头 (VFH实际选择的无阻挡方向)
-    m.id = 1;
+    m.id      = 1;
     m.color.r = 0.0;
     m.color.g = 1.0;
     m.color.b = 0.0;
@@ -926,31 +899,28 @@ void pub_viz_vfh_vectors(float t_yaw, float s_yaw, const Eigen::Vector2f &pos, f
 
     // 3. 画 VFH 内部视场雷达 (72根射线展示障碍物斥力分布)
     visualization_msgs::Marker hist_msg;
-    hist_msg.header.frame_id = "map";
-    hist_msg.header.stamp = ros::Time::now();
-    hist_msg.ns = "vfh_histogram";
-    hist_msg.id = 2;
-    hist_msg.type = visualization_msgs::Marker::LINE_LIST;
-    hist_msg.action = visualization_msgs::Marker::ADD;
-    hist_msg.scale.x = 0.02; // 线宽
+    hist_msg.header.frame_id    = "map";
+    hist_msg.header.stamp       = ros::Time::now();
+    hist_msg.ns                 = "vfh_histogram";
+    hist_msg.id                 = 2;
+    hist_msg.type               = visualization_msgs::Marker::LINE_LIST;
+    hist_msg.action             = visualization_msgs::Marker::ADD;
+    hist_msg.scale.x            = 0.02;  // 线宽
     hist_msg.pose.orientation.w = 1.0;
 
-    for (int i = 0; i < 72; ++i)
-    {
-        float b_yaw = -M_PI + i * (2 * M_PI / 72) + (M_PI / 72) * 0.5f;
+    for (int i = 0; i < 72; ++i) {
+        float b_yaw   = -M_PI + i * (2 * M_PI / 72) + (M_PI / 72) * 0.5f;
         float abs_yaw = b_yaw + current_yaw;
 
         geometry_msgs::Point p1, p2;
-        p1.x = pos.x();
-        p1.y = pos.y();
-        p1.z = init_pos_z + cfg.takeoff_height;
+        p1.x           = pos.x();
+        p1.y           = pos.y();
+        p1.z           = init_pos_z + cfg.takeoff_height;
 
         // 射线长度代表代价大小 (最长画 1.5 米)
         float cost_len = hist[i] * 0.1f;
-        if (cost_len < 0.2f)
-            cost_len = 0.2f; // 空旷地带画个短线示意
-        if (cost_len > 1.5f)
-            cost_len = 1.5f;
+        if (cost_len < 0.2f) cost_len = 0.2f;  // 空旷地带画个短线示意
+        if (cost_len > 1.5f) cost_len = 1.5f;
 
         p2.x = pos.x() + std::cos(abs_yaw) * cost_len;
         p2.y = pos.y() + std::sin(abs_yaw) * cost_len;
@@ -961,15 +931,13 @@ void pub_viz_vfh_vectors(float t_yaw, float s_yaw, const Eigen::Vector2f &pos, f
 
         std_msgs::ColorRGBA color;
         color.a = 0.8;
-        if (hist[i] > 15.0f)
-        {
+        if (hist[i] > 15.0f) {
             // 被阻挡的死路：画红色长线
             color.r = 1.0;
             color.g = 0.0;
             color.b = 0.0;
         }
-        else
-        {
+        else {
             // 安全可走的路：画青色短线
             color.r = 0.0;
             color.g = 1.0;
@@ -1042,8 +1010,7 @@ void pub_viz_grid_map(const OccupancyGrid2D &grid) {
 // ============================================================================
 // 逻辑封装：执行单步避障 (引入 all_obs)
 // ============================================================================
-bool execute_avoidance_step(Eigen::Vector2f goal, const std::vector<Obstacle> &all_obs)
-{
+bool execute_avoidance_step(Eigen::Vector2f goal, const std::vector<Obstacle> &all_obs) {
     Eigen::Vector2f curr(local_pos.pose.pose.position.x, local_pos.pose.pose.position.y);
     float dist_to_goal = (curr - goal).norm();
 
@@ -1051,50 +1018,45 @@ bool execute_avoidance_step(Eigen::Vector2f goal, const std::vector<Obstacle> &a
     ROS_INFO_THROTTLE(1.5, "[导航追踪] 目标点: (%.1f, %.1f) | 剩余距离: %.2f m | 当前高度: %.1f m",
                       goal.x(), goal.y(), dist_to_goal, local_pos.pose.pose.position.z);
 
-    bool blocked = is_path_blocked(global_path_smooth, global_grid, cfg.check_radius_buffer);
+    bool blocked  = is_path_blocked(global_path_smooth, global_grid, cfg.check_radius_buffer);
     bool cooldown = (ros::Time::now() - last_replan_time).toSec() > cfg.replan_cooldown;
 
-    if (!has_global_plan || (blocked && cooldown))
-    {
-        if (blocked && has_global_plan)
-        {
+    if (!has_global_plan || (blocked && cooldown)) {
+        if (blocked && has_global_plan) {
             ROS_WARN("[A* 重规划] 路径被前方新增的障碍物截断！正在寻找新路径...");
         }
 
-        if (run_astar(global_grid, curr, goal, global_path_raw))
-        {
+        if (run_astar(global_grid, curr, goal, global_path_raw)) {
             global_path_smooth = BSplinePlanner::generate_smooth_path(global_path_raw, 10);
-            has_global_plan = true;
-            last_replan_time = ros::Time::now();
-            vfh_first_run = true;
+            has_global_plan    = true;
+            last_replan_time   = ros::Time::now();
+            vfh_first_run      = true;
             ROS_INFO("[A* 规划成功] 生成平滑轨迹，共 %lu 个航点", global_path_smooth.size());
         }
-        else
-        {
-            ROS_WARN_THROTTLE(1.0, "[A* 规划失败] 找不到通往 (%.1f, %.1f) 的路径！无人机原地悬停等待...", goal.x(), goal.y());
+        else {
+            ROS_WARN_THROTTLE(1.0,
+                              "[A* 规划失败] 找不到通往 (%.1f, %.1f) 的路径！无人机原地悬停等待...",
+                              goal.x(), goal.y());
             setpoint_raw.position.x = curr.x();
             setpoint_raw.position.y = curr.y();
-            has_global_plan = false;
+            has_global_plan         = false;
             return false;
         }
     }
 
-    if (has_global_plan)
-    {
+    if (has_global_plan) {
         Eigen::Vector2f la = get_lookahead_point(global_path_smooth, curr, cfg.lookahead_dist);
-        bool stuck = false;
+        bool stuck         = false;
 
-        bool reached = run_vfh_plus(la, all_obs, stuck);
+        bool reached       = run_vfh_plus(la, all_obs, stuck);
 
-        if (stuck)
-        {
+        if (stuck) {
             ROS_WARN("[VFH+ 异常] 局部避障死锁或触发紧急制动，请求 A* 介入...");
             has_global_plan = false;
         }
 
         // 到达目标点判定
-        if (dist_to_goal < 0.3)
-        {
+        if (dist_to_goal < 0.3) {
             ROS_INFO("[导航完毕] 已成功抵达目标点 (%.1f, %.1f)！", goal.x(), goal.y());
             return true;
         }
@@ -1211,31 +1173,27 @@ int main(int argc, char **argv) {
         // -----------------------------------------------------------
         // [新增架构]：每帧统一构建、合并、刷新，杜绝重影与双重衰减
         // -----------------------------------------------------------
-        if (flag_init_pos && static_walls.empty())
-        {
+        if (flag_init_pos && static_walls.empty()) {
             build_static_walls();
         }
         // 合并：PCL 抓到的真实柱子 + 焊死的虚拟围墙
         std::vector<Obstacle> all_obs = obstacles;
-        if (!static_walls.empty())
-        {
+        if (!static_walls.empty()) {
             all_obs.insert(all_obs.end(), static_walls.begin(), static_walls.end());
         }
 
         global_grid.update_with_memory(all_obs, cfg.uav_radius, cfg.safe_margin);
         static int map_pub_cnt = 0;
-        if (map_pub_cnt++ % 5 == 0)
-        {
+        if (map_pub_cnt++ % 5 == 0) {
             pub_viz_grid_map(global_grid);
-            if (has_global_plan)
-            {
+            if (has_global_plan) {
                 pub_viz_astar_path(global_path_raw);
                 pub_viz_smooth_path(global_path_smooth);
             }
         }
         pub_setpoint.publish(setpoint_raw);
         mission_step = (int)state;
-        float dt = 0.05f;
+        float dt     = 0.05f;
 
         switch (state) {
         case IDLE:
@@ -1290,7 +1248,7 @@ int main(int argc, char **argv) {
             break;
 
         case TURN1: {
-            float target_yaw       = init_yaw_take_off  - M_PI / 2.0;
+            float target_yaw       = init_yaw_take_off - M_PI / 2.0;
             setpoint_raw.yaw       = calc_smooth_yaw(target_yaw, setpoint_raw.yaw, dt);
             setpoint_raw.type_mask = 0b101111111000;
             if (get_yaw_diff(target_yaw) < 0.1) {
@@ -1326,7 +1284,7 @@ int main(int argc, char **argv) {
             break;
 
         case TURN2: {
-            float target_yaw = init_yaw_take_off  + M_PI;
+            float target_yaw = init_yaw_take_off + M_PI;
             setpoint_raw.yaw = calc_smooth_yaw(target_yaw, setpoint_raw.yaw, dt);
             if (get_yaw_diff(target_yaw) < 0.1) {
                 state           = LEG3_AVOID;
@@ -1361,7 +1319,7 @@ int main(int argc, char **argv) {
                 state = LANDING_SEARCH;
                 ROS_INFO(">>> 降落搜索");
                 search_mode_dir = false;
-                last_req = ros::Time::now();
+                last_req        = ros::Time::now();
             }
             break;
 
@@ -1378,7 +1336,7 @@ int main(int argc, char **argv) {
                 setpoint_raw.velocity.x = satfunc(
                     (scan_y - local_pos.pose.pose.position.y) * cfg.p_xy, cfg.vel_track_max);
                 setpoint_raw.position.z = init_pos_z + cfg.takeoff_height;
-                setpoint_raw.yaw = init_yaw_take_off;
+                setpoint_raw.yaw        = init_yaw_take_off;
 
                 if (!search_mode_dir) {
                     setpoint_raw.velocity.x =
@@ -1404,7 +1362,7 @@ int main(int argc, char **argv) {
             break;
 
         case LANDING_FOLLOW: {
-            
+
             if (flag) {
                 setpoint_raw.position.z = local_pos.pose.pose.position.z - 0.15;
                 if (local_pos.pose.pose.position.z < init_pos_z + 0.15) {
@@ -1419,8 +1377,8 @@ int main(int argc, char **argv) {
                 ROS_WARN("目标丢失，重新搜索");
                 break;
             }
-            if (land_detected) last_req = ros::Time::now();
-            {
+            if (land_detected) {
+                last_req = ros::Time::now();
                 float vx = satfunc(yolo_result.point.y * cfg.yolo_follow_kp, cfg.vel_track_max);
                 float vy = satfunc(yolo_result.point.x * cfg.yolo_follow_kp, cfg.vel_track_max);
                 setpoint_raw.type_mask  = 0b100111000011;
@@ -1433,6 +1391,11 @@ int main(int argc, char **argv) {
                     flag = true;
                     ROS_INFO(">>> 对准，降落");
                 }
+            }
+            else {
+                setpoint_raw.type_mask  = 0b100111000011;
+                setpoint_raw.velocity.x = 0;
+                setpoint_raw.velocity.y = 0;
             }
             break;
         }
@@ -1450,7 +1413,7 @@ int main(int argc, char **argv) {
             //     }
             //     break;
 
-        case FINISHED: setpoint_raw.type_mask = 0; break;
+        case FINISHED: setpoint_raw.type_mask = 0; return 0;
         }
 
         ros::spinOnce();
