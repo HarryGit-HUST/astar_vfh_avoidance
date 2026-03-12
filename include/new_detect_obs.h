@@ -6,9 +6,11 @@
 #include <vector>
 #include <cmath>
 #include <nav_msgs/Odometry.h>
-// 引入 PCL 检测包的消息类型
-#include <pcl_detection/ObjectDetectionResult.h>
-#include <pcl_detection/DetectedObject.h>
+// 替换原有的 #include <pcl_detection/...> 为以下内容
+#include <sensor_msgs/PointCloud2.h>
+#include <pcl_conversions/pcl_conversions.h>
+#include <pcl/point_cloud.h>
+#include <pcl/point_types.h>
 
 // ============================================================================
 // 全局变量声明
@@ -24,34 +26,32 @@ extern float if_debug;
 enum ObsType
 {
     WALL = 0,
-    RING = 3,  // 强调：环门必定是3
-    PILLAR = 4 // 方柱类型（原CYLINDER）
+    RING = 3,
+    PILLAR = 4
 };
 
 // ============================================================================
 // 核心定义：增强版障碍物结构体
 // ============================================================================
+// 专门留给静态电子围墙使用
 struct Obstacle
 {
     int id;
-    int type;                 // 障碍物类型 (WALL / RING / PILLAR)
-    Eigen::Vector2f position; // 中心位置 (cx, cy)
-    float radius;             // 墙体厚度/圆柱半径
-
-    // 墙体/老尺寸保留
+    int type;
+    Eigen::Vector2f position;
+    float radius;
     float width;
     float length;
     float angle;
-
-    // [终极新增]：真实 OBB 在 2D 地图上的多边形投影轮廓 (凸包)
     std::vector<Eigen::Vector2f> footprint;
 };
 
 // 全局障碍物列表容器
 extern std::vector<Obstacle> obstacles;
-
-// 回调函数声明
-void detection_cb_wrapper(const pcl_detection::ObjectDetectionResult::ConstPtr &msg);
-void livox_cb_wrapper(const livox_ros_driver::CustomMsg::ConstPtr &msg);
+// ==================
+// 声明新的全局变量
+// ==================
+extern pcl::PointCloud<pcl::PointXY>::Ptr current_cloud; // 实时 ROI 点云
+extern float current_target_yaw;                         // 飞控锁死的机头目标朝向
 
 #endif
