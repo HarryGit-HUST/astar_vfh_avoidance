@@ -53,5 +53,7 @@ extern std::vector<Obstacle> obstacles;
 // ==================
 extern pcl::PointCloud<pcl::PointXY>::Ptr current_cloud; // 实时 ROI 点云
 extern float current_target_yaw;                         // 飞控锁死的机头目标朝向
+// 替换为新的 2D 点云回调声明
+void pointcloud_cb(const sensor_msgs::PointCloud2ConstPtr &msg);
 
 #endif
