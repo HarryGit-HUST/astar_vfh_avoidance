@@ -736,7 +736,7 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &static_wa
 
             // [核心修复 2]：扩大自身屏蔽罩到 0.4m！
             // 彻底过滤掉无人机脚底下的 H 标起飞坪和机身噪点！
-            if (phys_d < 0.4f || phys_d > 4.0f)
+            if (phys_d < 0.2f || phys_d > 2.0f)
                 continue;
 
             // 只有前方真正挡路的点云，才允许触发紧急制动
@@ -783,17 +783,42 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &static_wa
 
     int best_idx = -1;
     float min_c = 1e9;
+
+    // ========================================================
+    // [核心修复] VFH 行为权重天平 (可后期移入 YAML)
+    // ========================================================
+    float weight_target = 0.8f; // 目标牵引权重 (降低！允许偏离 A* 路径)
+    float weight_obs = 0.9f;    // 避障斥力权重 (大幅增强！遇到障碍提前绕大弯)
+    float weight_smooth = 0.3f; // 运动惯性权重 (防止在两个缝隙间左右横跳)
+
+    // 遍历代价直方图，寻找最优平移方向
     for (int i = 0; i < BINS; ++i)
     {
         if (hist[i] > 100.0f)
-            continue;
+            continue; // 绝对禁区拦截 (太近了，此路不通)
+
         float b_yaw = -M_PI + i * (2 * M_PI / BINS) + (M_PI / BINS) * 0.5f;
+
+        // 1. 计算偏离目标点的代价
         float diff_target = b_yaw - rel_t_yaw;
         while (diff_target > M_PI)
             diff_target -= 2 * M_PI;
         while (diff_target < -M_PI)
             diff_target += 2 * M_PI;
-        float c = std::abs(diff_target) * 2.0f + hist[i] * 0.1f;
+
+        // 2. 计算偏离上一帧运动方向的代价 (保持走线丝滑)
+        float abs_travel_yaw = b_yaw + current_target_yaw; // 当前 bin 的世界绝对朝向
+        float diff_last = abs_travel_yaw - last_vfh_yaw;
+        while (diff_last > M_PI)
+            diff_last -= 2 * M_PI;
+        while (diff_last < -M_PI)
+            diff_last += 2 * M_PI;
+
+        // 3. 终极代价函数：平衡寻路、避障与平滑
+        float c = std::abs(diff_target) * weight_target +
+                  hist[i] * weight_obs +
+                  std::abs(diff_last) * weight_smooth;
+
         if (c < min_c)
         {
             min_c = c;
