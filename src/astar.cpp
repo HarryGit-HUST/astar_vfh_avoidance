@@ -691,35 +691,56 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &static_wa
         {
             float hl = o.length / 2.0f;
             Eigen::Vector2f w_dir(cos(o.angle), sin(o.angle));
-            Eigen::Vector2f p1 = o.position - w_dir * hl;
-            Eigen::Vector2f p2 = o.position + w_dir * hl;
+            Eigen::Vector2f p1 = o.position - w_dir * hl; // 墙的端点1
+            Eigen::Vector2f p2 = o.position + w_dir * hl; // 墙的端点2
 
-            float phys_d = std::sqrt(dist_sq_point_to_segment(curr, p1, p2)) - o.radius;
+            // ==========================================
+            // [核心几何修复] 寻找墙体线段上距离飞机最近的点
+            // ==========================================
+            Eigen::Vector2f v = p2 - p1;
+            Eigen::Vector2f w = curr - p1;
+            float c1 = w.dot(v);
+            float c2 = v.dot(v);
+            Eigen::Vector2f closest_pt;
+
+            if (c1 <= 0)
+                closest_pt = p1;
+            else if (c2 <= c1)
+                closest_pt = p2;
+            else
+                closest_pt = p1 + (c1 / c2) * v;
+
+            // 物理距离：到最近点的距离减去墙厚
+            float phys_d = (curr - closest_pt).norm() - o.radius;
             if (phys_d < 0.01f)
                 phys_d = 0.01f;
 
-            // [核心修复 1]：绝对不把静态墙计入 min_obs_d！
-            // 否则飞机只要挨着墙起飞，就会触发全局死锁不敢往前飞。
-            // if (phys_d < min_obs_d) min_obs_d = phys_d; <--- 这句删除了！
-
-            if (phys_d > 4.0)
+            // 注意：我们依然不把墙体计入 min_obs_d，防止起飞死锁
+            // 但如果墙体太远，VFH 就不考虑它了
+            if (phys_d > 3.0f)
                 continue;
 
-            Eigen::Vector2f to_obs = o.position - curr;
-            float angle = std::atan2(to_obs.y(), to_obs.x()) - current_target_yaw;
+            //[核心修正] 斥力方向必须是从“最近点”指向飞机，而不是墙的中心！
+            float angle = std::atan2(closest_pt.y() - curr.y(), closest_pt.x() - curr.x()) - current_target_yaw;
             while (angle > M_PI)
                 angle -= 2 * M_PI;
             while (angle < -M_PI)
                 angle += 2 * M_PI;
 
+            // 墙体视场角遮挡 (给予适当的避障膨胀)
             float w_ang = std::asin(std::min(0.85f, (cfg.uav_radius + 0.1f) / phys_d));
             int c_idx = (int)((angle + M_PI) / (2 * M_PI) * BINS) % BINS;
             int hw = (int)(w_ang / (2 * M_PI) * BINS) + 1;
 
-            float raw_cost = (phys_d < wall_safe_threshold) ? 1000.0f : (5.0f / phys_d);
-            for (int k = c_idx - hw; k <= c_idx + hw; ++k)
+            // 墙体专属斥力：靠得越近，斥力越大，逼迫绿箭头远离墙体
+            float raw_cost = (phys_d < cfg.uav_radius + 0.15f) ? 500.0f : (10.0f / phys_d);
+
+            // 填入 VFH 直方图
+            for (int k = -hw; k <= hw; ++k)
             {
-                int idx = (k + BINS) % BINS;
+                int idx = (c_idx + k) % BINS;
+                if (idx < 0)
+                    idx += BINS;
                 hist[idx] = std::max(hist[idx], raw_cost);
             }
         }
@@ -836,21 +857,28 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &static_wa
     float final_travel_yaw = -M_PI + best_idx * (2 * M_PI / BINS) + (M_PI / BINS) * 0.5f + current_target_yaw;
     pub_viz_vfh_vectors(t_yaw, final_travel_yaw, curr, hist);
 
+    // 速度自适应平滑
     float diff = final_travel_yaw - t_yaw;
     while (diff > M_PI)
         diff -= 2 * M_PI;
     while (diff < -M_PI)
         diff += 2 * M_PI;
+
     float speed = std::min(cfg.max_speed, dist);
-    if (std::abs(diff) > 0.8)
-        speed *= 0.3;
-    else if (std::abs(diff) > 0.3)
-        speed *= 0.7;
-    
+
+    // [修改] 放宽限速惩罚！
+    // 只有偏离超过 60度(1.0rad) 时，才降速到 60%
+    if (std::abs(diff) > 1.0f)
+        speed *= 0.6f;
+    // 偏离超过 25度(0.4rad) 时，降速到 85%
+    else if (std::abs(diff) > 0.4f)
+        speed *= 0.85f;
+    // 直走时保持 100% cfg.max_speed 满速飞行！
+
     ROS_INFO_THROTTLE(1.0, "[VFH] 目标航向: %.2f°, 当前航向: %.2f°, 航向差: %.2f°, 线速度: %.2fm/s", t_yaw * 180 / M_PI, current_target_yaw * 180 / M_PI, diff * 180 / M_PI, speed);
 
-    setpoint_raw.position.x = curr.x() + std::cos(final_travel_yaw) * speed * 0.05;
-    setpoint_raw.position.y = curr.y() + std::sin(final_travel_yaw) * speed * 0.05;
+    setpoint_raw.position.x = curr.x() + std::cos(final_travel_yaw) * speed * 0.08;
+    setpoint_raw.position.y = curr.y() + std::sin(final_travel_yaw) * speed * 0.08;
     setpoint_raw.yaw = current_target_yaw;
 
     return false;
