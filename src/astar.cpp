@@ -820,6 +820,8 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &static_wa
         speed *= 0.3;
     else if (std::abs(diff) > 0.3)
         speed *= 0.7;
+    
+    ROS_INFO_THROTTLE(1.0, "[VFH] 目标航向: %.2f°, 当前航向: %.2f°, 航向差: %.2f°, 线速度: %.2fm/s", t_yaw * 180 / M_PI, current_target_yaw * 180 / M_PI, diff * 180 / M_PI, speed);
 
     setpoint_raw.position.x = curr.x() + std::cos(final_travel_yaw) * speed * 0.05;
     setpoint_raw.position.y = curr.y() + std::sin(final_travel_yaw) * speed * 0.05;
