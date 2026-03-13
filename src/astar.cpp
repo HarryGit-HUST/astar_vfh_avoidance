@@ -605,6 +605,7 @@ std::vector<Eigen::Vector2f> BSplinePlanner::generate_smooth_path(const std::vec
         dist_accum += dist_left;
     }
     resampled_path.push_back(raw_spline.back());
+    ROS_INFO("长度: %.2f, 原点数: %lu, 平滑后点数: %lu", raw_spline.size() * 0.1f, cps.size(), resampled_path.size());
     return resampled_path;
 }
 
@@ -982,7 +983,7 @@ bool execute_avoidance_step(Eigen::Vector2f goal, const std::vector<Obstacle> &s
         if (run_astar(global_grid, curr, goal, global_path_raw))
         {
             global_path_smooth = BSplinePlanner::generate_smooth_path(global_path_raw, 10);
-            ROS_INFO_THROTTLE(1.0, "[A*] 规划路径成功，路径长度: %.2fm", path_length(global_path_smooth));
+            
 
             has_global_plan = true;
             last_replan_time = ros::Time::now();
