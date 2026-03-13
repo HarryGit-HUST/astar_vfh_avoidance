@@ -856,11 +856,11 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &static_wa
 
     float final_travel_yaw = -M_PI + best_idx * (2 * M_PI / BINS) + (M_PI / BINS) * 0.5f + current_target_yaw;
     pub_viz_vfh_vectors(t_yaw, final_travel_yaw, curr, hist);
-
+    float speed = cfg.max_speed;
     // 2. [绝对限速]：绝不允许超过设定的最高速度
     if(dist < 0.3f)
-        target_speed = std::min(target_speed, 0.8f); // 近距离时，最高速度降到 0.8m/s，增加控制精度
-    float speed = cfg.max_speed;
+        peed = std::min(target_speed, 0.8f); // 近距离时，最高速度降到 0.8m/s，增加控制精度
+    
 
     // 3. [基于视角的弯道限速]
     float diff = final_travel_yaw - t_yaw;
