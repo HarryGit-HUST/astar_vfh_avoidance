@@ -859,7 +859,7 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &static_wa
     float speed = cfg.max_speed;
     // 2. [绝对限速]：绝不允许超过设定的最高速度
     if(dist < 0.3f)
-        speed = std::min(target_speed, 0.8f); // 近距离时，最高速度降到 0.8m/s，增加控制精度
+        speed = std::min(speed, 0.8f); // 近距离时，最高速度降到 0.8m/s，增加控制精度
     
 
     // 3. [基于视角的弯道限速]
