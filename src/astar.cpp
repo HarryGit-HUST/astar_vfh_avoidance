@@ -276,7 +276,9 @@ void build_static_walls()
     float cy = (left_y + right_y) / 2.0f;
     float len_x = std::abs(front_x - back_x);
     float len_y = std::abs(left_y - right_y);
-    float wall_thickness = 0.2f;
+
+    //[修改] 把墙削薄，防止向内过度挤压起飞空间
+    float wall_thickness = 0.05f;
 
     Obstacle front_obs;
     front_obs.type = WALL;
@@ -310,7 +312,6 @@ void build_static_walls()
 
     ROS_INFO("✅ 高精电子围栏已激活！边界: X[%.1f, %.1f], Y[%.1f, %.1f]", back_x, front_x, right_y, left_y);
 }
-
 void pointcloud_cb(const sensor_msgs::PointCloud2ConstPtr &msg)
 {
     if (!flag_init_pos)
@@ -676,8 +677,13 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &static_wa
     const int BINS = 72;
     float hist[BINS] = {0};
     float min_obs_d = 1e9;
-    float safe_threshold = cfg.uav_radius + cfg.safe_margin + 0.2f;
 
+    // 墙体的硬隔离阈值：机身即可，不需要过度加 margin，否则起飞直接红圈
+    float wall_safe_threshold = cfg.uav_radius + 0.1f;
+    // 动态点云的隔离阈值
+    float cloud_safe_threshold = cfg.uav_radius + cfg.safe_margin + 0.15f;
+
+    // 1. 处理静态虚拟墙
     for (const auto &o : static_walls)
     {
         if (o.type == WALL)
@@ -686,12 +692,16 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &static_wa
             Eigen::Vector2f w_dir(cos(o.angle), sin(o.angle));
             Eigen::Vector2f p1 = o.position - w_dir * hl;
             Eigen::Vector2f p2 = o.position + w_dir * hl;
+
             float phys_d = std::sqrt(dist_sq_point_to_segment(curr, p1, p2)) - o.radius;
-            if (phys_d < 0)
-                phys_d = 0;
-            if (phys_d < min_obs_d)
-                min_obs_d = phys_d;
-            if (phys_d > 3.0 || phys_d < 0.05)
+            if (phys_d < 0.01f)
+                phys_d = 0.01f;
+
+            // [核心修复 1]：绝对不把静态墙计入 min_obs_d！
+            // 否则飞机只要挨着墙起飞，就会触发全局死锁不敢往前飞。
+            // if (phys_d < min_obs_d) min_obs_d = phys_d; <--- 这句删除了！
+
+            if (phys_d > 4.0)
                 continue;
 
             Eigen::Vector2f to_obs = o.position - curr;
@@ -701,14 +711,20 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &static_wa
             while (angle < -M_PI)
                 angle += 2 * M_PI;
 
-            float w_ang = std::asin(std::min(1.0f, (o.radius + cfg.uav_radius + cfg.safe_margin) / (phys_d + 0.1f)));
+            float w_ang = std::asin(std::min(0.85f, (cfg.uav_radius + 0.1f) / phys_d));
             int c_idx = (int)((angle + M_PI) / (2 * M_PI) * BINS) % BINS;
             int hw = (int)(w_ang / (2 * M_PI) * BINS) + 1;
+
+            float raw_cost = (phys_d < wall_safe_threshold) ? 1000.0f : (5.0f / phys_d);
             for (int k = c_idx - hw; k <= c_idx + hw; ++k)
-                hist[(k + BINS) % BINS] += 10.0f / (phys_d + 0.1f);
+            {
+                int idx = (k + BINS) % BINS;
+                hist[idx] = std::max(hist[idx], raw_cost);
+            }
         }
     }
 
+    // 2. 处理实时动态点云
     if (current_cloud != nullptr)
     {
         for (const auto &pt : current_cloud->points)
@@ -716,8 +732,13 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &static_wa
             float dx = pt.x - curr.x();
             float dy = pt.y - curr.y();
             float phys_d = std::hypot(dx, dy);
-            if (phys_d < 0.2f || phys_d > 3.0f)
+
+            // [核心修复 2]：扩大自身屏蔽罩到 0.4m！
+            // 彻底过滤掉无人机脚底下的 H 标起飞坪和机身噪点！
+            if (phys_d < 0.4f || phys_d > 4.0f)
                 continue;
+
+            // 只有前方真正挡路的点云，才允许触发紧急制动
             if (phys_d < min_obs_d)
                 min_obs_d = phys_d;
 
@@ -732,7 +753,8 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &static_wa
             int c_idx = (int)((ang + M_PI) / (2 * M_PI) * BINS) % BINS;
             if (c_idx < 0)
                 c_idx += BINS;
-            float raw_cost = (phys_d < safe_threshold) ? 1000.0f : (10.0f / phys_d);
+
+            float raw_cost = (phys_d < cloud_safe_threshold) ? 1000.0f : (10.0f / phys_d);
             for (int k = -hw; k <= hw; ++k)
             {
                 int idx = (c_idx + k) % BINS;
@@ -743,9 +765,10 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &static_wa
         }
     }
 
+    // [核心修复 3]：紧急制动现在只对“除了墙以外”的障碍物有效
     if (min_obs_d < cfg.min_safe_dist)
     {
-        ROS_WARN_THROTTLE(1.0, "[VFH 紧急制动] 距实体仅 %.2fm", min_obs_d);
+        ROS_WARN_THROTTLE(1.0, "[VFH 紧急制动] 前方/侧方动态障碍物仅 %.2fm", min_obs_d);
         need_replan = true;
         return false;
     }
@@ -779,7 +802,7 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &static_wa
 
     if (best_idx == -1)
     {
-        ROS_WARN_THROTTLE(1.0, "[VFH 死锁] 无路可走，请求 A* 重规划");
+        ROS_WARN_THROTTLE(1.0, "[VFH 死锁] 视场内无路可走，请求 A* 重规划");
         need_replan = true;
         return false;
     }
@@ -804,7 +827,6 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &static_wa
 
     return false;
 }
-
 void pub_viz_vfh_vectors(float t_yaw, float s_yaw, const Eigen::Vector2f &pos, float hist[72])
 {
     visualization_msgs::Marker m;
