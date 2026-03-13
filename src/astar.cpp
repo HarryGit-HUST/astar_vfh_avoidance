@@ -672,7 +672,7 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &static_wa
     Eigen::Vector2f curr(local_pos.pose.pose.position.x, local_pos.pose.pose.position.y);
     Eigen::Vector2f dir = target - curr;
     float dist = dir.norm();
-    if (dist < 0.2)
+    if (dist < 0.1)
         return true;
 
     const int BINS = 72;
@@ -857,23 +857,23 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &static_wa
     float final_travel_yaw = -M_PI + best_idx * (2 * M_PI / BINS) + (M_PI / BINS) * 0.5f + current_target_yaw;
     pub_viz_vfh_vectors(t_yaw, final_travel_yaw, curr, hist);
 
-    // 速度自适应平滑
+    // 2. [绝对限速]：绝不允许超过设定的最高速度
+    if(dist < 0.3f)
+        target_speed = std::min(target_speed, 0.8f); // 近距离时，最高速度降到 0.8m/s，增加控制精度
+    float speed = cfg.max_speed;
+
+    // 3. [基于视角的弯道限速]
     float diff = final_travel_yaw - t_yaw;
     while (diff > M_PI)
         diff -= 2 * M_PI;
     while (diff < -M_PI)
         diff += 2 * M_PI;
 
-    float speed = std::min(cfg.max_speed, dist);
-
-    // [修改] 放宽限速惩罚！
-    // 只有偏离超过 60度(1.0rad) 时，才降速到 60%
     if (std::abs(diff) > 1.0f)
-        speed *= 0.6f;
-    // 偏离超过 25度(0.4rad) 时，降速到 85%
+        speed *= 0.6f; // 剧烈侧飞躲避时，降速到 60%
     else if (std::abs(diff) > 0.4f)
-        speed *= 0.85f;
-    // 直走时保持 100% cfg.max_speed 满速飞行！
+        speed *= 0.85f; // 轻微绕行时，降速到 85%
+
 
     ROS_INFO_THROTTLE(1.0, "[VFH] 目标航向: %.2f°, 当前航向: %.2f°, 航向差: %.2f°, 线速度: %.2fm/s", t_yaw * 180 / M_PI, current_target_yaw * 180 / M_PI, diff * 180 / M_PI, speed);
 
@@ -1303,7 +1303,7 @@ int main(int argc, char **argv)
 
         case TURN1:
         {
-            current_target_yaw = init_yaw_take_off;
+            current_target_yaw = init_yaw_take_off - M_PI/2;
             setpoint_raw.yaw = calc_smooth_yaw(current_target_yaw, setpoint_raw.yaw, dt);
             setpoint_raw.type_mask = 0b101111111000;
             if (get_yaw_diff(current_target_yaw) < 0.1)
@@ -1344,7 +1344,7 @@ int main(int argc, char **argv)
 
         case TURN2:
         {
-            current_target_yaw = init_yaw_take_off + M_PI;
+            current_target_yaw = init_yaw_take_off - M_PI;
             setpoint_raw.yaw = calc_smooth_yaw(current_target_yaw, setpoint_raw.yaw, dt);
             if (get_yaw_diff(current_target_yaw) < 0.1)
             {
