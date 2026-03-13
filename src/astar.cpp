@@ -799,7 +799,7 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &static_wa
             best_idx = i;
         }
     }
-
+    ROS_INFO_THROTTLE(1.0, "[VFH] 最佳航向 idx: %d, 代价: %.2f, 障碍物代价: %.2f", best_idx, min_c, hist[best_idx]);
     if (best_idx == -1)
     {
         ROS_WARN_THROTTLE(1.0, "[VFH 死锁] 视场内无路可走，请求 A* 重规划");
@@ -972,6 +972,7 @@ bool execute_avoidance_step(Eigen::Vector2f goal, const std::vector<Obstacle> &s
     ROS_INFO_THROTTLE(1.5, "[导航] 目标: (%.1f, %.1f) | 剩余: %.2fm", goal.x(), goal.y(), dist_to_goal);
 
     bool blocked = is_path_blocked(global_path_smooth, global_grid, cfg.check_radius_buffer);
+    ROS_INFO_THROTTLE(1.0, "[导航] 路径阻塞: %s", blocked ? "是" : "否");
     bool cooldown = (ros::Time::now() - last_replan_time).toSec() > cfg.replan_cooldown;
 
     if (!has_global_plan || (blocked && cooldown))
@@ -979,6 +980,8 @@ bool execute_avoidance_step(Eigen::Vector2f goal, const std::vector<Obstacle> &s
         if (run_astar(global_grid, curr, goal, global_path_raw))
         {
             global_path_smooth = BSplinePlanner::generate_smooth_path(global_path_raw, 10);
+            ROS_INFO_THROTTLE(1.0, "[A*] 规划路径成功，路径长度: %.2fm", path_length(global_path_smooth));
+
             has_global_plan = true;
             last_replan_time = ros::Time::now();
             vfh_first_run = true;
@@ -996,6 +999,7 @@ bool execute_avoidance_step(Eigen::Vector2f goal, const std::vector<Obstacle> &s
     if (has_global_plan)
     {
         Eigen::Vector2f la = get_lookahead_point(global_path_smooth, curr, cfg.lookahead_dist);
+        ROS_INFO_THROTTLE(1.0, "[VFH] 查找前视点: (%.2f, %.2f)", la.x(), la.y());
         bool stuck = false;
         run_vfh_plus(la, static_walls, stuck);
         if (stuck)
