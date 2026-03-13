@@ -369,6 +369,7 @@ void OccupancyGrid2D::update_with_memory(const std::vector<Obstacle> &static_wal
 
     Eigen::Vector2f drone_p(local_pos.pose.pose.position.x, local_pos.pose.pose.position.y);
 
+    // 1. 栅格地图衰减记忆
     for (int i = 0; i < grid_w; ++i)
     {
         for (int j = 0; j < grid_h; ++j)
@@ -384,27 +385,24 @@ void OccupancyGrid2D::update_with_memory(const std::vector<Obstacle> &static_wal
         }
     }
 
-    float total_margin = drone_r + safe_margin;
-    float margin_sq = total_margin * total_margin;
-
+    // 2. 静态虚拟墙 (依然保留适度膨胀，保证 A* 绝不越过场外边界)
+    float static_margin = drone_r;
     for (const auto &obs : static_walls)
     {
-        if (obs.footprint.empty() && obs.type != WALL)
-            continue;
-
         if (obs.type == WALL)
         {
             float hl = obs.length / 2.0f;
             Eigen::Vector2f dir(cos(obs.angle), sin(obs.angle));
             Eigen::Vector2f p1 = obs.position - dir * hl;
             Eigen::Vector2f p2 = obs.position + dir * hl;
-            float exp = obs.radius + total_margin;
+            float exp = obs.radius + static_margin;
             float exp_sq = exp * exp;
 
             float min_x = std::min(p1.x(), p2.x()) - exp;
             float max_x = std::max(p1.x(), p2.x()) + exp;
             float min_y = std::min(p1.y(), p2.y()) - exp;
             float max_y = std::max(p1.y(), p2.y()) + exp;
+
             int min_gx, min_gy, max_gx, max_gy;
             world_to_grid(min_x, min_y, min_gx, min_gy);
             world_to_grid(max_x, max_y, max_gx, max_gy);
@@ -412,6 +410,7 @@ void OccupancyGrid2D::update_with_memory(const std::vector<Obstacle> &static_wal
             min_gy = std::max(0, min_gy);
             max_gx = std::min(grid_w - 1, max_gx);
             max_gy = std::min(grid_h - 1, max_gy);
+
             for (int x = min_gx; x <= max_gx; ++x)
             {
                 for (int y = min_gy; y <= max_gy; ++y)
@@ -425,34 +424,24 @@ void OccupancyGrid2D::update_with_memory(const std::vector<Obstacle> &static_wal
         }
     }
 
-    int r_cells = std::ceil(total_margin / resolution);
+    // 3. ROI 动态点云：【彻底取消膨胀】
+    // 既然点云本身已经处理过（或表示物理实体），我们直接 1:1 精确映射到栅格！
     if (current_cloud != nullptr)
     {
         for (const auto &pt : current_cloud->points)
         {
+            // 过滤掉因为机身自身反射造成的近距离噪点
             if (std::hypot(pt.x - drone_p.x(), pt.y - drone_p.y()) < 0.2f)
                 continue;
+
             int gx, gy;
-            if (!world_to_grid(pt.x, pt.y, gx, gy))
-                continue;
-            for (int dx = -r_cells; dx <= r_cells; ++dx)
+            if (world_to_grid(pt.x, pt.y, gx, gy))
             {
-                for (int dy = -r_cells; dy <= r_cells; ++dy)
-                {
-                    if (dx * dx * resolution * resolution + dy * dy * resolution * resolution <= margin_sq)
-                    {
-                        int nx = gx + dx, ny = gy + dy;
-                        if (nx >= 0 && nx < grid_w && ny >= 0 && ny < grid_h)
-                        {
-                            cells[nx][ny] = MAX_HEALTH;
-                        }
-                    }
-                }
+                cells[gx][gy] = MAX_HEALTH; // 不再外扩，只涂黑这一个格子
             }
         }
     }
 }
-
 bool run_astar(const OccupancyGrid2D &grid, Eigen::Vector2f start, Eigen::Vector2f goal, std::vector<Eigen::Vector2f> &out_path)
 {
     out_path.clear();
