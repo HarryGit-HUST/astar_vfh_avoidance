@@ -312,11 +312,19 @@ void build_static_walls()
 
     ROS_INFO("✅ 高精电子围栏已激活！边界: X[%.1f, %.1f], Y[%.1f, %.1f]", back_x, front_x, right_y, left_y);
 }
+// [修复] 点云回调函数：物理隔绝起飞期间的地面污染
 void pointcloud_cb(const sensor_msgs::PointCloud2ConstPtr &msg)
 {
     if (!flag_init_pos)
         return;
+
+    // IDLE = 0, TAKEOFF = 1, LEG1_AVOID = 2
+    // 如果还没进入避障阶段（如起飞中），直接丢弃雷达数据，绝不让地面进地图！
+    if (mission_step < 2)
+        return;
+
     pcl::fromROSMsg(*msg, *current_cloud);
+    // ROS_INFO_THROTTLE(1.0, "[感知] 收到 ROI 点云: %zu 个障碍点", current_cloud->points.size());
 }
 
 // ------------------ 动态二维地图函数 ------------------
@@ -362,6 +370,8 @@ bool OccupancyGrid2D::is_occupied(int gx, int gy) const
 
 void OccupancyGrid2D::update_with_memory(const std::vector<Obstacle> &static_walls, float drone_r, float safe_margin)
 {
+    // [新增声明] 用于起飞后清空地面污染
+    void clear();
     if (grid_w == 0 || grid_h == 0)
         return;
     bool is_fast_turning = std::abs(current_yaw_rate) > cfg.rotation_gating_threshold;
@@ -443,6 +453,15 @@ void OccupancyGrid2D::update_with_memory(const std::vector<Obstacle> &static_wal
         }
     }
 }
+//[新增实现] 瞬间清空二维地图记忆
+void OccupancyGrid2D::clear()
+{
+    for (auto &col : cells)
+    {
+        std::fill(col.begin(), col.end(), 0);
+    }
+}
+
 bool run_astar(const OccupancyGrid2D &grid, Eigen::Vector2f start, Eigen::Vector2f goal, std::vector<Eigen::Vector2f> &out_path)
 {
     out_path.clear();
@@ -886,10 +905,14 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &static_wa
 
 
     ROS_INFO_THROTTLE(1.0, "[VFH] 目标航向: %.2f°, 当前航向: %.2f°, 航向差: %.2f°, 线速度: %.2fm/s", t_yaw * 180 / M_PI, current_target_yaw * 180 / M_PI, diff * 180 / M_PI, speed);
+    // =========================================================================
+    // [核心修复]：废除 * 0.05 的极近牵引，改为 1.0 秒的前视远点牵引 (Carrot-on-a-stick)
+    // =========================================================================
+    float lookahead_time = 1.0f; // 在期望方向上，投影出 1.0 秒后的位置作为飞控目标
 
-    setpoint_raw.position.x = curr.x() + std::cos(final_travel_yaw) * speed * 0.08;
-    setpoint_raw.position.y = curr.y() + std::sin(final_travel_yaw) * speed * 0.08;
-    setpoint_raw.yaw = current_target_yaw;
+    setpoint_raw.position.x = curr.x() + std::cos(final_travel_yaw) * speed * lookahead_time;
+    setpoint_raw.position.y = curr.y() + std::sin(final_travel_yaw) * speed * lookahead_time;
+    setpoint_raw.yaw = current_target_yaw; // 机头死死锁住
 
     return false;
 }
@@ -1295,12 +1318,18 @@ int main(int argc, char **argv)
             setpoint_raw.position.x = init_pos_x;
             setpoint_raw.position.y = init_pos_y;
             setpoint_raw.yaw = current_target_yaw;
+
+            // 当到达起飞高度时
             if (std::abs(local_pos.pose.pose.position.z - setpoint_raw.position.z) < 0.2)
             {
                 state = LEG1_AVOID;
                 has_global_plan = false;
-                nh.setParam("/pcl_enable", true);
-                ROS_INFO(">>> 平移避障往 WP1");
+
+                // [核心修复] 起飞完毕的瞬间，将起飞时的地面噪点彻底擦除，干干净净地出发！
+                global_grid.clear();
+                current_cloud->clear();
+
+                ROS_INFO(">>> 起飞完成，地图已清洗，平移避障往 WP1");
             }
             break;
 
