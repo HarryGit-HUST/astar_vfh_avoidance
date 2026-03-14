@@ -34,7 +34,7 @@ roslaunch tutorial_gazebo sim.launch" C-m
 # 窗口 1: PCL 感知
 # ====================================================
 tmux new-window -t $SESSION:1 -n "pcl_perception"
-tmux send-keys -t $SESSION:1 "sleep 10; source ${MAIN_WS}/devel/setup.bash; cd ${MAIN_WS}/src/pcl_detection/shell; bash obs.bash" C-m
+tmux send-keys -t $SESSION:1 "sleep 10; source ${MAIN_WS}/devel/setup.bash; cd ${MAIN_WS}/src/pcl_detection2/shell; bash pcl_detection.sh" C-m
 
 # ====================================================
 # 窗口 2: 任务控制与视觉 (Mission + YOLO)
