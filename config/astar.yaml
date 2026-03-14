@@ -9,7 +9,7 @@ planner:
   takeoff_height: 0.7     # 起飞/巡航高度
   
   # --- 速度与加速度限制 ---
-  max_speed: 0.9          # 最大飞行速度 (m/s)
+  max_speed: 0.6         # 最大飞行速度 (m/s)
   max_yaw_rate: 0.6        # [关键] 最大旋转角速度 (rad/s), 越小转弯越柔和
   yaw_smooth_weight: 0.5   # [关键] VFH角度低通滤波系数 (0.0~1.0), 越小越平滑但反应越慢
 

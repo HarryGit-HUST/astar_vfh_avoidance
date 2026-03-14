@@ -65,7 +65,10 @@ struct OccupancyGrid2D
     void grid_to_world(int gx, int gy, float &wx, float &wy) const;
     bool is_occupied(int gx, int gy) const;
     void update_with_memory(const std::vector<Obstacle> &static_walls, float drone_r, float safe_margin);
+    void clear();
+    
 };
+
 
 class BSplinePlanner
 {
