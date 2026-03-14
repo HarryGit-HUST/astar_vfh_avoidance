@@ -1289,6 +1289,7 @@ int main(int argc, char **argv)
             {
                 state = LEG1_AVOID;
                 has_global_plan = false;
+                nh.setParam("/pcl_enable", true);
                 ROS_INFO(">>> 平移避障往 WP1");
             }
             break;
