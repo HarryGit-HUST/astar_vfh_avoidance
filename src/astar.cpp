@@ -278,7 +278,7 @@ void build_static_walls()
     float len_y = std::abs(left_y - right_y);
 
     //[修改] 把墙削薄，防止向内过度挤压起飞空间
-    float wall_thickness = 0.05f;
+    float wall_thickness = 0.15f;
 
     Obstacle front_obs;
     front_obs.type = WALL;
@@ -684,65 +684,75 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &static_wa
     // 动态点云的隔离阈值
     float cloud_safe_threshold = cfg.uav_radius + cfg.safe_margin + 0.15f;
 
-    // 1. 处理静态虚拟墙
+    // ========================================================================
+    // 1. 处理静态虚拟墙 (Geofencing) 斥力 —— [核心修复：解决出墙回不来 Bug]
+    // ========================================================================
     for (const auto &o : static_walls)
     {
-        if (o.type == WALL)
+        if (o.footprint.empty())
+            continue;
+
+        // distToPolygon: 如果在多边形内部返回 0，外部返回距离
+        // 注意：因为我们画的是线段宽化后的包围盒，这里我们需要重新定义“越界”
+        float phys_d = distToPolygon(curr, o.footprint);
+
+        // [关键机制 1]：如果 phys_d == 0，说明飞机已经“陷入”虚拟墙内部，或者完全跑到墙外面去了！
+        // 此时我们绝对不能再给它施加斥力把它往外推，必须直接 continue，让 A* 的引力把它拉回正常区域！
+        if (phys_d < 0.01f)
         {
-            float hl = o.length / 2.0f;
-            Eigen::Vector2f w_dir(cos(o.angle), sin(o.angle));
-            Eigen::Vector2f p1 = o.position - w_dir * hl; // 墙的端点1
-            Eigen::Vector2f p2 = o.position + w_dir * hl; // 墙的端点2
+            continue;
+        }
 
-            // ==========================================
-            // [核心几何修复] 寻找墙体线段上距离飞机最近的点
-            // ==========================================
-            Eigen::Vector2f v = p2 - p1;
-            Eigen::Vector2f w = curr - p1;
-            float c1 = w.dot(v);
-            float c2 = v.dot(v);
-            Eigen::Vector2f closest_pt;
+        // 不把它计入 min_obs_d，防止触发全局死锁不敢起飞
+        if (phys_d > 3.0f)
+            continue;
 
-            if (c1 <= 0)
-                closest_pt = p1;
-            else if (c2 <= c1)
-                closest_pt = p2;
-            else
-                closest_pt = p1 + (c1 / c2) * v;
+        std::vector<float> angles;
+        for (const auto &pt : o.footprint)
+        {
+            float ang = std::atan2(pt.y() - curr.y(), pt.x() - curr.x()) - current_target_yaw;
+            while (ang > M_PI)
+                ang -= 2 * M_PI;
+            while (ang < -M_PI)
+                ang += 2 * M_PI;
+            angles.push_back(ang);
+        }
 
-            // 物理距离：到最近点的距离减去墙厚
-            float phys_d = (curr - closest_pt).norm() - o.radius;
-            if (phys_d < 0.01f)
-                phys_d = 0.01f;
+        // [关键机制 2]：收缩虚拟墙的视网膜膨胀角
+        // 以前是用无人机本体半径去膨胀墙，导致很远就觉得没路了。
+        // 现在我们把虚拟墙的视觉压迫感调小 (只用 0.1m 的裕度)，让它可以贴墙飞
+        float margin_angle = std::asin(std::min(0.85f, (0.1f) / phys_d));
+        std::sort(angles.begin(), angles.end());
 
-            // 注意：我们依然不把墙体计入 min_obs_d，防止起飞死锁
-            // 但如果墙体太远，VFH 就不考虑它了
-            if (phys_d > 3.0f)
-                continue;
-
-            //[核心修正] 斥力方向必须是从“最近点”指向飞机，而不是墙的中心！
-            float angle = std::atan2(closest_pt.y() - curr.y(), closest_pt.x() - curr.x()) - current_target_yaw;
-            while (angle > M_PI)
-                angle -= 2 * M_PI;
-            while (angle < -M_PI)
-                angle += 2 * M_PI;
-
-            // 墙体视场角遮挡 (给予适当的避障膨胀)
-            float w_ang = std::asin(std::min(0.85f, (cfg.uav_radius + 0.1f) / phys_d));
-            int c_idx = (int)((angle + M_PI) / (2 * M_PI) * BINS) % BINS;
-            int hw = (int)(w_ang / (2 * M_PI) * BINS) + 1;
-
-            // 墙体专属斥力：靠得越近，斥力越大，逼迫绿箭头远离墙体
-            float raw_cost = (phys_d < cfg.uav_radius + 0.15f) ? 500.0f : (10.0f / phys_d);
-
-            // 填入 VFH 直方图
-            for (int k = -hw; k <= hw; ++k)
+        float max_gap = angles[0] + 2 * M_PI - angles.back();
+        int gap_idx = angles.size() - 1;
+        for (size_t i = 0; i < angles.size() - 1; ++i)
+        {
+            float gap = angles[i + 1] - angles[i];
+            if (gap > max_gap)
             {
-                int idx = (c_idx + k) % BINS;
-                if (idx < 0)
-                    idx += BINS;
-                hist[idx] = std::max(hist[idx], raw_cost);
+                max_gap = gap;
+                gap_idx = i;
             }
+        }
+
+        float start_ang = (gap_idx != angles.size() - 1) ? angles[gap_idx + 1] - margin_angle : angles[0] - margin_angle;
+        float end_ang = (gap_idx != angles.size() - 1) ? angles[gap_idx] + 2 * M_PI + margin_angle : angles.back() + margin_angle;
+
+        //[关键机制 3]：将钢铁禁区改为“海绵墙” (Soft Wall)
+        // 阈值从 uav_radius + safe_margin (约0.6m) 剧烈压缩到了 0.2m。
+        // 并且即使小于 0.2m，也不再给毁灭性的 1000.0，而是给一个 80.0 的强斥力，允许极端情况下强行挤过去。
+        float wall_safe_threshold = 0.2f;
+        float raw_cost = (phys_d < wall_safe_threshold) ? 80.0f : (10.0f / phys_d);
+
+        int steps = std::ceil((end_ang - start_ang) / (2 * M_PI / BINS));
+        for (int k = 0; k <= steps; ++k)
+        {
+            float a = start_ang + k * (2 * M_PI / BINS);
+            int idx = (int)((a + M_PI) / (2 * M_PI) * BINS) % BINS;
+            if (idx < 0)
+                idx += BINS;
+            hist[idx] = std::max(hist[idx], raw_cost);
         }
     }
 
