@@ -908,7 +908,7 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &static_wa
     // =========================================================================
     // [核心修复]：废除 * 0.05 的极近牵引，改为 1.0 秒的前视远点牵引 (Carrot-on-a-stick)
     // =========================================================================
-    float lookahead_time = 1.0f; // 在期望方向上，投影出 1.0 秒后的位置作为飞控目标
+    float lookahead_time = 0.6f; // 在期望方向上，投影出 1.0 秒后的位置作为飞控目标
 
     setpoint_raw.position.x = curr.x() + std::cos(final_travel_yaw) * speed * lookahead_time;
     setpoint_raw.position.y = curr.y() + std::sin(final_travel_yaw) * speed * lookahead_time;
