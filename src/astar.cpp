@@ -1307,6 +1307,7 @@ int main(int argc, char **argv)
                     flag_init_pos = true;
                 }
                 state = TAKEOFF;
+                nh.setParam("/pcl_enable", true);
                 ROS_INFO(">>> 起飞");
             }
             break;
@@ -1326,7 +1327,7 @@ int main(int argc, char **argv)
                 has_global_plan = false;
 
                 // [核心修复] 起飞完毕的瞬间，将起飞时的地面噪点彻底擦除，干干净净地出发！
-                nh.setParam("/pcl_enable", true);
+                
                 global_grid.clear();
                 current_cloud->clear();
                 
