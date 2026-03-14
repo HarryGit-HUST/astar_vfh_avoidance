@@ -818,7 +818,7 @@ bool run_vfh_plus(Eigen::Vector2f target, const std::vector<Obstacle> &static_wa
     // ========================================================
     // [核心修复] VFH 行为权重天平 (可后期移入 YAML)
     // ========================================================
-    float weight_target = 0.8f; // 目标牵引权重 (降低！允许偏离 A* 路径)
+    float weight_target = 0.9f; // 目标牵引权重 (降低！允许偏离 A* 路径)
     float weight_obs = 0.9f;    // 避障斥力权重 (大幅增强！遇到障碍提前绕大弯)
     float weight_smooth = 0.3f; // 运动惯性权重 (防止在两个缝隙间左右横跳)
 
